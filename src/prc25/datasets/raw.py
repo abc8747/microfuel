@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 import polars as pl
 
@@ -17,17 +17,13 @@ class Config(TypedDict):
     bucket_access_secret: str
 
 
-# NOTE: end dataset wrappers
-# the following functions generates the dataset
-
-
 def load_config(fp: Path = PATH_DATA / "config.toml") -> Config:
     if sys.version_info >= (3, 11):
         import tomllib
     else:
         import tomli as tomllib
-    with open(fp, "r") as f:
-        return tomllib.loads(f.read())  # type: ignore
+    with open(fp, "rb") as f:
+        return tomllib.load(f)  # type: ignore
 
 
 def setup_mc_alias(
@@ -52,8 +48,43 @@ def download_from_s3(
     """Download data from S3 using MinIO client.
     Not using boto3 because it is extremely slow."""
     path_out.mkdir(parents=True, exist_ok=True)
-    
     setup_mc_alias(bucket_access_key, bucket_access_secret, endpoint_url, alias_name)
-    
     cmd = f"mc cp --recursive {alias_name}/{bucket_name}/ {path_out}/"
     os.system(cmd)
+
+
+#
+# wrappers
+#
+
+Partition = Literal["train", "rank"] | str
+
+
+def load_fuel_data(partition: Partition = "train") -> pl.LazyFrame:
+    filename = (
+        "fuel_rank_submission.parquet" if partition == "rank" else f"fuel_{partition}.parquet"
+    )
+    fp = PATH_DATA_RAW / filename
+    return pl.scan_parquet(fp)
+
+
+def load_flight_list(partition: Partition = "train") -> pl.LazyFrame:
+    filename = f"flight_list_{partition}.parquet"
+    fp = PATH_DATA_RAW / filename
+    return pl.scan_parquet(fp)
+
+
+def load_airports() -> pl.LazyFrame:
+    fp = PATH_DATA_RAW / "apt.parquet"
+    return pl.scan_parquet(fp)
+
+
+def get_trajectory_path(flight_id: str, partition: str = "train") -> Path:
+    return PATH_DATA_RAW / f"flights_{partition}" / f"{flight_id}.parquet"
+
+
+def load_trajectory(flight_id: str, partition: str = "train") -> pl.LazyFrame | None:
+    fp = get_trajectory_path(flight_id, partition)
+    if not fp.exists():
+        return None
+    return pl.scan_parquet(fp)
