@@ -8,24 +8,24 @@ Clone the repository, install and activate your virtual environment.
 
 === "pip"
 
-     ```sh
-     pip3 install virtualenv --break-system-packages
-     virtualenv .venv
-     . .venv/bin/activate
-     pip3 install ".[dev]"
-     ```
+    ```sh
+    pip3 install virtualenv --break-system-packages
+    virtualenv .venv
+    . .venv/bin/activate
+    pip3 install ".[dev]"
+    ```
 
 === "uv"
 
-     ```sh
-     pip3 install uv --break-system-packages
-     uv venv
-     uv sync --all-extras
-     ```
+    ```sh
+    pip3 install uv --break-system-packages
+    uv venv
+    uv sync --all-extras
+    ```
 
-     Activate your virtual environment with `. .venv/bin/activate`, alternatively, use `uv run python3 scripts/{FILENAME}.py` to run a particular script.
+    Activate your virtual environment with `. .venv/bin/activate`, alternatively, use `uv run python3 scripts/{FILENAME}.py` to run a particular script.
 
-This repo does not come with raw data. See [here](./data.md) for instructions to set it up.
+This repo does not come with raw data. See [here](./concepts.md) for instructions to set it up.
 
 ## Quickstart
 
@@ -38,11 +38,11 @@ Code is structured as follows:
 
 In the root directory, run
 
-    ```sh
-    mkdocs build
-    ```
+```sh
+mkdocs build
+```
 
-and navigate to <https://localhost:8080/prc-datachallenge/>.
+and navigate to <https://localhost:8080/prc25/>.
 
 ## Python Code style
 
@@ -58,12 +58,16 @@ We use the following tools to check the style on each push:
 
 Locally, run the following before committing:
 
-    ```sh
-    just fmt
-    ```
+```sh
+just fmt
+```
 
 Recommended VSCode extensions: `charliermarsh.ruff`, `matangover.mypy`, `usernamehw.errorlens`, `ms-toolsai.jupyter`
 
+### Data provision
+
+First, install the MinIO client (`mc`), necessary for pulling and pushing to OpenSky's S3 bucket.
+
 ### Leaderboard
 
-To make submissions, use `data/credentials.example.toml` as the template.
+To make submissions, use `data/config.example.toml` as the template.

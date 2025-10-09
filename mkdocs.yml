@@ -1,0 +1,104 @@
+site_name: prc25
+site_description: An open machine learning model to infer the fuel consumed of a flown flight.
+repo_name: abc8747/prc25
+repo_url: https://github.com/abc8747/prc25
+site_url: https://abc8747.github.io/prc25/
+nav:
+  - Quickstart: "README.md"
+  - Concepts: "concepts.md"
+
+theme:
+  name: material
+  features:
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+    - navigation.expand
+  palette:
+    - scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  icon:
+    repo: fontawesome/brands/github
+plugins:
+  - search
+  - social
+  - mkdocstrings:
+      handlers:
+        python:
+          inventories:
+            - https://docs.python.org/3/objects.inv
+            - https://numpy.org/doc/stable/objects.inv
+            - https://pola-rs.github.io/polars/py-polars/html/objects.inv # unstable, see https://github.com/pola-rs/polars/issues/7027
+            - https://einops.rocks/objects.inv
+          options:
+            # member
+            inherited_members: true
+            members_order: source
+            # signature
+            separate_signature: true
+            show_signature_annotations: true
+            # docstring
+            docstring_style: sphinx
+            docstring_section_style: table
+            signature_crossrefs: true
+            show_source: true
+            # heading
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+            show_root_heading: true
+      enable_inventory: true
+markdown_extensions:
+  - abbr
+  - attr_list
+  - admonition
+  - footnotes
+  - md_in_html
+  - pymdownx.details
+  - pymdownx.blocks.tab:
+      alternate_style: true
+      slugify: !!python/object/apply:pymdownx.slugs.slugify
+        kwds:
+          case: lower
+  - pymdownx.tilde
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.highlight:
+      pygments_lang_class: true
+  - pymdownx.inlinehilite:
+      style_plain_text: py3
+  - pymdownx.magiclink
+  - pymdownx.snippets:
+      base_path: [!relative $config_dir]
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+      slugify: !!python/object/apply:pymdownx.slugs.slugify
+        kwds:
+          case: lower
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - toc:
+      permalink: "¤"
+  - pymdownx.arithmatex:
+      generic: true
+
+extra_javascript:
+  - assets/js/katex.js
+  - https://cdn.jsdelivr.net/npm/katex@0.16.23/dist/katex.min.js
+  - https://cdn.jsdelivr.net/npm/katex@0.16.23/dist/contrib/auto-render.min.js
+  - https://cdn.jsdelivr.net/npm/katex@0.16.23/dist/contrib/copy-tex.min.js
+
+extra_css:
+  - https://cdn.jsdelivr.net/npm/katex@0.16.23/dist/katex.min.css
