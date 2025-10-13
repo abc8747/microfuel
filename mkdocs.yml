@@ -5,7 +5,8 @@ repo_url: https://github.com/abc8747/prc25
 site_url: https://abc8747.github.io/prc25/
 nav:
   - Quickstart: "README.md"
-  - Concepts: "concepts.md"
+  - Data: "data.md"
+  - Problem: "problem.md"
 
 theme:
   name: material

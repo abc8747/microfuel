@@ -6,6 +6,7 @@ import numpy as np
 import polars as pl
 import typer
 from matplotlib.axes import Axes
+from matplotlib.ticker import ScalarFormatter
 from rich.logging import RichHandler
 from rich.progress import track
 
@@ -14,7 +15,7 @@ from prc25.datasets import raw
 from prc25.plot import MPL
 
 logger = logging.getLogger(__name__)
-app = typer.Typer(no_args_is_help=True)
+app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
 
 
 @app.command()
@@ -36,11 +37,11 @@ PATH_EDA_OUTPUT = PATH_DATA / "eda"
 
 
 @eda.command()
-def flight_duration() -> None:
-    fig = MPL.default_fig(figsize=(8, 12))
+def flight_duration_cdf() -> None:
+    fig = MPL.default_fig(figsize=(10, 8))
     ax = fig.add_subplot(111)
     df = (
-        raw.load_flight_list("train")
+        raw.scan_flight_list("train")
         .with_columns(
             duration_hours=(pl.col("landed") - pl.col("takeoff")).dt.total_seconds() / 3600
         )
@@ -48,25 +49,38 @@ def flight_duration() -> None:
     )
     total = len(df)
 
-    top_ac_types = df.group_by("aircraft_type").len().sort("len")
+    top_ac_types = df.group_by("aircraft_type").len().sort("len", descending=True)
+    num_types = len(top_ac_types)
 
-    data = []
-    labels = []
-    for row in top_ac_types.iter_rows(named=True):
+    for i, row in enumerate(top_ac_types.iter_rows(named=True)):
         ac_type = row["aircraft_type"]
         count = row["len"]
-        pct = (count / total) * 100
-        durations = df.filter(pl.col("aircraft_type") == ac_type)["duration_hours"].to_list()
-        data.append(durations)
-        labels.append(f"{ac_type} ({pct:.2f}%)")
+        fraction = count / total
+        durations = np.sort(
+            df.filter(pl.col("aircraft_type") == ac_type)["duration_hours"].to_numpy()
+        )
+        cdf = np.arange(1, len(durations) + 1) / len(durations) * 100
 
-    ax.violinplot(data, positions=range(len(data)), showmeans=True, vert=False)
+        color = MPL.C[i % len(MPL.C)]
+        ax.plot(durations, cdf, color=color, linewidth=10 * max(fraction, 0.1))
 
-    ax.set_yticks(range(len(labels)))
-    ax.set_yticklabels(labels)
-    ax.set_ylabel("Aircraft Type")
+        y_position = (i / (num_types - 1)) * 100 if num_types > 1 else 50
+        cdf_idx = np.searchsorted(cdf, y_position)
+        duration_at_y = durations[cdf_idx] if cdf_idx < len(durations) else durations[-1]
+        ax.text(
+            duration_at_y,
+            y_position,
+            f" {ac_type} ({fraction:.1%})",
+            va="center",
+            ha="left",
+            fontsize=36 * max(fraction, 0.2),
+            color=color,
+        )
+
     ax.set_xlabel("Flight Duration (hours)")
-    ax.grid(True, alpha=0.6, axis="x")
+    ax.set_ylabel("Cumulative Frequency (%)")
+    ax.set_ylim(0, 100)
+    ax.grid(True, alpha=0.3)
 
     output_path = PATH_EDA_OUTPUT / "flight_duration.pdf"
     fig.savefig(output_path, bbox_inches="tight")
@@ -304,6 +318,60 @@ def fuel_quantisation(tolerance: float = 0.01) -> None:
     fig.savefig(output_path, bbox_inches="tight", dpi=300)
     plt.close(fig)
     logger.info(f"wrote {output_path}")
+
+
+def _calculate_time_gaps(lf: pl.LazyFrame) -> pl.Series:
+    return (
+        lf.sort("flight_id", "timestamp")
+        .with_columns(
+            (pl.col("timestamp").diff().over("flight_id").dt.total_seconds()).alias("gap_s")
+        )
+        .select("gap_s")
+        .drop_nulls()
+        .filter(pl.col("gap_s") > 0)
+        .collect()["gap_s"]
+    )
+
+
+def _plot_cdf(ax: Axes, data: pl.Series, label: str, color: str) -> None:
+    sorted_data = np.sort(data.to_numpy())
+    cdf = np.arange(1, len(sorted_data) + 1) / len(sorted_data) * 100
+    ax.plot(sorted_data, cdf, linestyle="-", label=label, color=color)
+
+
+@eda.command()
+def time_gap_cdf() -> None:
+    traj_lf = raw.scan_all_trajectories("train")
+    all_gaps = _calculate_time_gaps(traj_lf)
+    adsb_gaps = _calculate_time_gaps(traj_lf.filter(pl.col("source") == "adsb"))
+    acars_gaps = _calculate_time_gaps(traj_lf.filter(pl.col("source") == "acars"))
+    fuel_lf = raw.scan_fuel("train")
+    segment_lengths = (
+        fuel_lf.with_columns((pl.col("end") - pl.col("start")).dt.total_seconds().alias("length_s"))
+        .filter(pl.col("length_s") > 0)
+        .collect()["length_s"]
+    )
+
+    MPL._init_style()
+    fig, ax = plt.subplots(1, 1, figsize=(16, 8))
+
+    _plot_cdf(ax, all_gaps, "time gaps (all)", MPL.C[0])
+    _plot_cdf(ax, adsb_gaps, "time gaps (adsb)", MPL.C[1])
+    _plot_cdf(ax, acars_gaps, "time gaps (acars)", MPL.C[2])
+    _plot_cdf(ax, segment_lengths, "segment lengths (fuel data)", MPL.C[3])
+
+    ax.set_xscale("log")
+    ax.set_ylim(0, 100)
+    ax.set_xlabel("Time (seconds)")
+    ax.set_ylabel("Cumulative Frequency (%)")
+    ax.grid(True, which="both", linewidth=0.5)
+    ax.xaxis.set_major_formatter(ScalarFormatter())
+    ax.legend()
+
+    output_path = PATH_EDA_OUTPUT / "distributions.pdf"
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"wrote plot to {output_path}")
 
 
 if __name__ == "__main__":

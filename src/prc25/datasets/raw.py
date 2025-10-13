@@ -60,7 +60,7 @@ def download_from_s3(
 Partition = Literal["train", "rank"] | str
 
 
-def load_fuel_data(partition: Partition = "train") -> pl.LazyFrame:
+def scan_fuel(partition: Partition = "train") -> pl.LazyFrame:
     filename = (
         "fuel_rank_submission.parquet" if partition == "rank" else f"fuel_{partition}.parquet"
     )
@@ -68,23 +68,28 @@ def load_fuel_data(partition: Partition = "train") -> pl.LazyFrame:
     return pl.scan_parquet(fp)
 
 
-def load_flight_list(partition: Partition = "train") -> pl.LazyFrame:
+def scan_flight_list(partition: Partition = "train") -> pl.LazyFrame:
     filename = f"flight_list_{partition}.parquet"
     fp = PATH_DATA_RAW / filename
     return pl.scan_parquet(fp)
 
 
-def load_airports() -> pl.LazyFrame:
+def scan_airports() -> pl.LazyFrame:
     fp = PATH_DATA_RAW / "apt.parquet"
     return pl.scan_parquet(fp)
 
 
-def get_trajectory_path(flight_id: str, partition: str = "train") -> Path:
+def scan_all_trajectories(partition: Partition = "train") -> pl.LazyFrame:
+    path = PATH_DATA_RAW / f"flights_{partition}"
+    return pl.scan_parquet(f"{path}/*.parquet")
+
+
+def fp_trajectory(flight_id: str, partition: str = "train") -> Path:
     return PATH_DATA_RAW / f"flights_{partition}" / f"{flight_id}.parquet"
 
 
-def load_trajectory(flight_id: str, partition: str = "train") -> pl.LazyFrame | None:
-    fp = get_trajectory_path(flight_id, partition)
+def scan_trajectory(flight_id: str, partition: str = "train") -> pl.LazyFrame | None:
+    fp = fp_trajectory(flight_id, partition)
     if not fp.exists():
         return None
     return pl.scan_parquet(fp)

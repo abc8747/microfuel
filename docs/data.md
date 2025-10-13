@@ -1,4 +1,4 @@
-# Concepts
+# Data
 
 ## First party data
 
@@ -18,7 +18,11 @@ Directly from the S3 bucket.
 | `end`       | UTC   | TIMESTAMP WITH TIMEZONE | The end timestamp of the interval                              |
 | `fuel_kg`   | kg    | DOUBLE                  | The target variable. In submission files, this is set to `0.0` |
 
-`fuel_kg` target variable has quantisation artifacts: data is not a simple continuous distribution but a composite from at least two distinct sources: imperial (pounds) and metric (kilograms) units with a 2sf rounding step.
+!!! note
+    The `start` and `end` often correspond to the timestamps of ACARS reports.
+
+!!! warning
+    `fuel_kg` target variable has quantisation artifacts: data is not a simple continuous distribution but a composite from at least two distinct sources: imperial (pounds) and metric (kilograms) units with a 2sf rounding step.
 
 ### 2. Flight List (`flight_list_*.parquet`)
 
@@ -98,16 +102,3 @@ idx   flight_id     start                end                  fuel_kg
 
 !!! important "Missing Rows"
     Only the `idx` and `fuel_kg` columns are used for scoring. If the submission is missing rows that are present in the template, they will be assigned a value of `0.0`, which may negatively impact your RMSE score.
-
-## TODO
-
-- [ ] remove anomalous data points (sudden jumps in altitude or speed)
-- [ ] should we impute large time gaps in the data or simply use positional embedding and missing values?
-
-third party sources of information
-
-- [ ] google-arco era5 for isa deviation, GS -> TAS conversion, temperature, pressure
-- [ ] kinematic features ($p, q, r$, $\dot{x}, \dot{y}, \dot{z}$)
-- [ ] specific energy (potential + kinetic)
-- [ ] https://github.com/DGAC/Acropole
-
