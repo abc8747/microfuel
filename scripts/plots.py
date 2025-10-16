@@ -10,7 +10,7 @@ from matplotlib.ticker import ScalarFormatter
 from rich.logging import RichHandler
 from rich.progress import track
 
-from prc25 import PATH_DATA
+from prc25 import PATH_DATA, PATH_PREPROCESSED
 from prc25.datasets import raw
 from prc25.plot import MPL
 
@@ -18,25 +18,10 @@ logger = logging.getLogger(__name__)
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
 
 
+PATH_PLOTS_OUTPUT = PATH_DATA / "plots"
+
+
 @app.command()
-def download_raw():
-    from prc25.datasets.raw import download_from_s3, load_config
-
-    config = load_config()
-    download_from_s3(config["bucket_access_key"], config["bucket_access_secret"])
-
-
-#
-# exploratory data analysis
-#
-
-eda = typer.Typer(no_args_is_help=True)
-app.add_typer(eda, name="eda", help="exploratory data analysis")
-
-PATH_EDA_OUTPUT = PATH_DATA / "eda"
-
-
-@eda.command()
 def flight_duration_cdf() -> None:
     fig = MPL.default_fig(figsize=(10, 8))
     ax = fig.add_subplot(111)
@@ -61,7 +46,7 @@ def flight_duration_cdf() -> None:
         )
         cdf = np.arange(1, len(durations) + 1) / len(durations) * 100
 
-        color = MPL.C[i % len(MPL.C)]
+        color = f"C{i % 10}"
         ax.plot(durations, cdf, color=color, linewidth=10 * max(fraction, 0.1))
 
         y_position = (i / (num_types - 1)) * 100 if num_types > 1 else 50
@@ -82,17 +67,17 @@ def flight_duration_cdf() -> None:
     ax.set_ylim(0, 100)
     ax.grid(True, alpha=0.3)
 
-    output_path = PATH_EDA_OUTPUT / "flight_duration.pdf"
+    output_path = PATH_PLOTS_OUTPUT / "flight_duration.pdf"
     fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
     logger.info(f"wrote {output_path}")
 
 
-@eda.command()
+@app.command()
 def od_graph() -> None:
     fig = MPL.default_fig(figsize=(13, 12))
     ax = fig.add_subplot(111)
-    df = raw.load_flight_list("train").collect()
+    df = raw.scan_flight_list("train").collect()
 
     top_routes = df.group_by(["origin_icao", "destination_icao"]).len().sort("len", descending=True)
 
@@ -147,18 +132,18 @@ def od_graph() -> None:
 
     ax.axis("off")
 
-    output_path = PATH_EDA_OUTPUT / "od_graph.pdf"
+    output_path = PATH_PLOTS_OUTPUT / "od_graph.pdf"
     fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
     logger.info(f"wrote {output_path}")
 
 
-@eda.command()
+@app.command()
 def speed_alt_fuel_burn(max_points_per_actype: float | None = 1000) -> None:
     """This is a very slow plot: takes ~1 minute"""
     fig = MPL.default_fig(figsize=(20, 20))
 
-    flight_list_lf = raw.load_flight_list("train")
+    flight_list_lf = raw.scan_flight_list("train")
 
     top_ac_types = (
         flight_list_lf.group_by("aircraft_type")
@@ -183,7 +168,7 @@ def speed_alt_fuel_burn(max_points_per_actype: float | None = 1000) -> None:
         flight_list_sample = flight_list_lf.collect()
 
     fuel_df = (
-        raw.load_fuel_data("train")
+        raw.scan_fuel("train")
         .with_columns(
             (pl.col("fuel_kg") / (pl.col("end") - pl.col("start")).dt.total_seconds()).alias(
                 "avg_fuel_burn_rate_kg_s"
@@ -198,7 +183,7 @@ def speed_alt_fuel_burn(max_points_per_actype: float | None = 1000) -> None:
     axes = fig.subplots(4, 4, sharex=True, sharey=True)
 
     for i, ac_type in enumerate(track(top_ac_types, description="Processing aircraft types")):
-        ax = axes.flatten()[i]
+        ax: Axes = axes.flatten()[i]
         data_subset = plot_df.filter(pl.col("aircraft_type") == ac_type)
 
         p_lower = max(0, data_subset["avg_fuel_burn_rate_kg_s"].quantile(0.01) or 0)
@@ -209,7 +194,7 @@ def speed_alt_fuel_burn(max_points_per_actype: float | None = 1000) -> None:
             total=data_subset.height,
             description=ac_type,
         ):
-            traj_lf = raw.load_trajectory(row["flight_id"], "train")
+            traj_lf = raw.scan_trajectory(row["flight_id"], "train")
             if traj_lf is None:
                 continue
 
@@ -251,7 +236,7 @@ def speed_alt_fuel_burn(max_points_per_actype: float | None = 1000) -> None:
         if i // 4 == 3:
             ax.set_xlabel("Groundspeed (knots)")
 
-    output_path = PATH_EDA_OUTPUT / "speed_alt_fuel_burn.png"
+    output_path = PATH_PLOTS_OUTPUT / "speed_alt_fuel_burn.png"
     fig.savefig(output_path, bbox_inches="tight", dpi=300)
     plt.close(fig)
 
@@ -261,9 +246,9 @@ def speed_alt_fuel_burn(max_points_per_actype: float | None = 1000) -> None:
 LBS_TO_KG = 0.45359237
 
 
-@eda.command()
+@app.command()
 def fuel_quantisation(tolerance: float = 0.01) -> None:
-    fuel_lf = raw.load_fuel_data("train")
+    fuel_lf = raw.scan_fuel("train")
 
     df = (
         fuel_lf.filter(pl.col("fuel_kg") > 0)
@@ -287,7 +272,7 @@ def fuel_quantisation(tolerance: float = 0.01) -> None:
     axes: list[Axes]
     fig, axes = plt.subplots(len(ranges), 1, figsize=(16, 12), sharex=False, sharey=True)
 
-    colors = {"metric": MPL.C[1], "imperial": MPL.C[2], "neither": MPL.C[3]}
+    colors = {"metric": "C1", "imperial": "C2", "neither": "C3"}
     y_positions = {"imperial": 1, "metric": 2, "neither": 3}
 
     for ax, (min_val, max_val) in zip(axes, ranges):
@@ -314,7 +299,7 @@ def fuel_quantisation(tolerance: float = 0.01) -> None:
     for ax in axes:
         ax.tick_params(axis="y", length=0)
 
-    output_path = PATH_EDA_OUTPUT / "fuel_quantisation.png"
+    output_path = PATH_PLOTS_OUTPUT / "fuel_quantisation.png"
     fig.savefig(output_path, bbox_inches="tight", dpi=300)
     plt.close(fig)
     logger.info(f"wrote {output_path}")
@@ -339,7 +324,7 @@ def _plot_cdf(ax: Axes, data: pl.Series, label: str, color: str) -> None:
     ax.plot(sorted_data, cdf, linestyle="-", label=label, color=color)
 
 
-@eda.command()
+@app.command()
 def time_gap_cdf() -> None:
     traj_lf = raw.scan_all_trajectories("train")
     all_gaps = _calculate_time_gaps(traj_lf)
@@ -355,10 +340,10 @@ def time_gap_cdf() -> None:
     MPL._init_style()
     fig, ax = plt.subplots(1, 1, figsize=(16, 8))
 
-    _plot_cdf(ax, all_gaps, "time gaps (all)", MPL.C[0])
-    _plot_cdf(ax, adsb_gaps, "time gaps (adsb)", MPL.C[1])
-    _plot_cdf(ax, acars_gaps, "time gaps (acars)", MPL.C[2])
-    _plot_cdf(ax, segment_lengths, "segment lengths (fuel data)", MPL.C[3])
+    _plot_cdf(ax, all_gaps, "time gaps (all)", "C0")
+    _plot_cdf(ax, adsb_gaps, "time gaps (adsb)", "C1")
+    _plot_cdf(ax, acars_gaps, "time gaps (acars)", "C2")
+    _plot_cdf(ax, segment_lengths, "segment lengths (fuel data)", "C3")
 
     ax.set_xscale("log")
     ax.set_ylim(0, 100)
@@ -368,10 +353,93 @@ def time_gap_cdf() -> None:
     ax.xaxis.set_major_formatter(ScalarFormatter())
     ax.legend()
 
-    output_path = PATH_EDA_OUTPUT / "distributions.pdf"
+    output_path = PATH_PLOTS_OUTPUT / "distributions.pdf"
     fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
     logger.info(f"wrote plot to {output_path}")
+
+
+@app.command()
+def preprocessed_trajectories(
+    partition: str = "train",
+    num_flights: int = 100,
+) -> None:
+    output_dir = PATH_PLOTS_OUTPUT / "preprocessed_trajectories"
+    output_dir.mkdir(exist_ok=True, parents=True)
+
+    preprocessed_lf = pl.scan_parquet(PATH_PREPROCESSED / f"trajectories_{partition}.parquet")
+    flight_list_lf = raw.scan_flight_list(partition)
+    fuel_lf = raw.scan_fuel(partition)
+
+    flight_ids = (
+        preprocessed_lf.select("flight_id")
+        .unique()
+        .sort("flight_id")
+        .head(num_flights)
+        .collect()
+        .to_series()
+        .to_list()
+    )
+
+    segments_lf = (
+        flight_list_lf.select("flight_id", "takeoff")
+        .filter(pl.col("flight_id").is_in(flight_ids))
+        .join(fuel_lf, on="flight_id")
+        .with_columns(
+            start_s=(pl.col("start") - pl.col("takeoff")).dt.total_seconds(fractional=True),
+            end_s=(pl.col("end") - pl.col("takeoff")).dt.total_seconds(fractional=True),
+        )
+    )
+
+    for flight_id in track(flight_ids, description="plotting trajectories"):
+        traj_df = preprocessed_lf.filter(pl.col("flight_id") == flight_id).collect()
+        segments_df = segments_lf.filter(pl.col("flight_id") == flight_id).collect()
+
+        fig = MPL.default_fig(figsize=(20, 8))
+        ax1 = fig.add_subplot(111)
+        ax2 = ax1.twinx()
+        ax3 = ax1.twinx()
+        ax3.spines["right"].set_position(("axes", 1.04))
+
+        time = traj_df["time_since_takeoff"]
+        p1 = ax1.scatter(time, traj_df["altitude"], s=1, color="C0", label="Altitude")
+        p2 = ax2.scatter(time, traj_df["groundspeed"], s=1, color="C1", label="Groundspeed")
+        p3 = ax3.scatter(time, traj_df["vertical_rate"], s=1, color="C2", label="Vertical Rate")
+
+        ax1.set_xlabel("Time Since Takeoff (s)")
+        ax1.set_ylabel("Altitude (ft)", color="C0")
+        ax2.set_ylabel("Groundspeed (kts)", color="C1")
+        ax3.set_ylabel("Vertical Rate (fpm)", color="C2")
+
+        ax1.tick_params(axis="y", labelcolor="C0")
+        ax2.tick_params(axis="y", labelcolor="C1")
+        ax3.tick_params(axis="y", labelcolor="C2")
+
+        for i, row in enumerate(segments_df.iter_rows(named=True)):
+            start, end = row["start_s"], row["end_s"]
+            color = f"C{(i + 3) % 10}"
+            ax1.axvspan(start, end, alpha=0.2, color=color)
+
+            segment_traj = traj_df.filter(pl.col("time_since_takeoff").is_between(start, end))
+            seq_len = end - start
+            label_text = f"{row['idx']}: {segment_traj.height}/{seq_len:.0f}s"
+
+            ax1.text(
+                (start + end) / 2,
+                ax1.get_ylim()[1] * 0.15,
+                label_text,
+                ha="center",
+                va="top",
+                rotation=45,
+                color=color,
+            )
+
+        fig.suptitle(f"flight id: {flight_id}")
+        fig.legend(handles=[p1, p2, p3], loc="upper right")
+        output_path = output_dir / f"{flight_id}.png"
+        fig.savefig(output_path, bbox_inches="tight", dpi=150)
+        logger.info(f"wrote {output_path}")
+        plt.close(fig)
 
 
 if __name__ == "__main__":

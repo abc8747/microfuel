@@ -44,13 +44,13 @@ def download_from_s3(
     bucket_name: str = "prc-2025-datasets",
     endpoint_url: str = "https://s3.opensky-network.org:443",
     alias_name: str = "prc2025",
-) -> None:
+) -> int:
     """Download data from S3 using MinIO client.
     Not using boto3 because it is extremely slow."""
     path_out.mkdir(parents=True, exist_ok=True)
     setup_mc_alias(bucket_access_key, bucket_access_secret, endpoint_url, alias_name)
     cmd = f"mc cp --recursive {alias_name}/{bucket_name}/ {path_out}/"
-    os.system(cmd)
+    return os.system(cmd)
 
 
 #

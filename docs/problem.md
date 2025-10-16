@@ -14,6 +14,37 @@ This problem structure allows for two inference paradigms. Given all observation
 - **Filtering:** Using only past and current data, $p(z(t) | X_{t_i \le t})$. This is a causal approach.
 - **Smoothing:** Using the entire observation history, $p(z(t) | X_{1:N})$. This is more powerful for offline analysis as it uses "future" data (relative to the segment) to correct state estimates, likely yielding a more accurate representation.
 
+## `v0.0.1`
+
+This serves as the baseline. For simplicity, we use A20N data only, and discard trajectory information not within $[t_{\text{start}}, t_{\text{end}}]$.
+
+The target variable is:
+
+$$
+y_{\text{avg}} = \frac{\text{fuel\_kg}}{t_{\text{end}} - t_{\text{start}}} \quad [\text{kg/s}]
+$$
+
+This simplifies the problem to a sequence-to-scalar regression task, avoiding direct integration of the instantaneous burn rate $\dot{m}_f(t)$.
+
+To explicitly handle the irregular sampling, each input vector $x_i \in \mathbb{R}^{D+2}$ is an augmentation of the raw observation $o_i$ with two temporal features:
+
+1. Time since takeoff ($\tau_i = t_i - t_{\text{takeoff}}$) for global temporal context
+2. Time elapsed since the previous observation ($\Delta t_i = t_i - t_{i-1}$) for local sampling rate. For the first observation in the segment ($i=1$), we set $\Delta t_1 = 0$.
+
+The final input vector at step $i$ is the concatenation:
+
+$$
+x_i = [o_i, \tau_i, \Delta t_i]
+$$
+
+where $o_i$ are observations.
+
+We use Gated DeltaNet, a linear RNN that processes the input sequence $X$ to update its hidden state matrix $S_t \in \mathbb{R}^{d_v \times d_k}$. The state transition from $t-1$ to $t$ is governed by the gated delta rule, a Householder-like transformation:
+
+$$
+S_t = S_{t-1} \odot \left( \alpha_t \odot (I - \beta_t k_t k_t^\top) \right) + \beta_t v_t k_t^\top
+$$
+
 ## TODO
 
 - [ ] tackle anomalous data points (sudden jumps in altitude or speed)
