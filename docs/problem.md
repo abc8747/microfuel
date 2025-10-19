@@ -18,36 +18,43 @@ This problem structure allows for two inference paradigms. Given all observation
 
 This serves as the baseline. For simplicity, we use A20N data only, and discard trajectory information not within $[t_{\text{start}}, t_{\text{end}}]$.
 
-The target variable is:
+To handle the positive-only, long-tailed distribution of the average fuel burn rate, we predict its log-transformed value. The target variable is:
 
 $$
-y_{\text{avg}} = \frac{\text{fuel\_kg}}{t_{\text{end}} - t_{\text{start}}} \quad [\text{kg/s}]
+y = \log\left(\frac{\text{fuel\_kg}}{t_{\text{end}} - t_{\text{start}}} + 1\right)
 $$
 
 This simplifies the problem to a sequence-to-scalar regression task, avoiding direct integration of the instantaneous burn rate $\dot{m}_f(t)$.
 
 To explicitly handle the irregular sampling, each input vector $x_i \in \mathbb{R}^{D+2}$ is an augmentation of the raw observation $o_i$ with two temporal features:
 
-1. Time since takeoff ($\tau_i = t_i - t_{\text{takeoff}}$) for global temporal context
-2. Time elapsed since the previous observation ($\Delta t_i = t_i - t_{i-1}$) for local sampling rate. For the first observation in the segment ($i=1$), we set $\Delta t_1 = 0$.
+1. Time since takeoff ($\tau_i = t_i - t_{\text{takeoff}}$) for global temporal context.
+2. Log-transformed time since the previous observation. The time gaps $\Delta t_i = t_i - t_{i-1}$ exhibit a long-tail distribution, spanning from seconds to hours - we use log transformation to stabilise training. For the first observation in the segment ($i=1$), we set $\Delta t_1 = 0$.
 
 The final input vector at step $i$ is the concatenation:
 
 $$
-x_i = [o_i, \tau_i, \Delta t_i]
+x_i = [o_i, \tau_i, \log(\Delta t_i + 1)]
 $$
 
 where $o_i$ are observations.
 
-We use Gated DeltaNet, a linear RNN that processes the input sequence $X$ to update its hidden state matrix $S_t \in \mathbb{R}^{d_v \times d_k}$. The state transition from $t-1$ to $t$ is governed by the gated delta rule, a Householder-like transformation:
+We use a **single layer** Gated DeltaNet, a linear RNN that processes the input sequence $X$ to update its hidden state matrix $S_t \in \mathbb{R}^{d_v \times d_k}$. The state transition from $t-1$ to $t$ is governed by the gated delta rule, a Householder-like transformation:
 
 $$
 S_t = S_{t-1} \odot \left( \alpha_t \odot (I - \beta_t k_t k_t^\top) \right) + \beta_t v_t k_t^\top
 $$
 
+| Dataset                     | Target                        | RMSE (kg/s) | RMSE (kg) |
+| --------------------------- | ----------------------------- | ----------- | --------- |
+| a320n, `seq_len` ∈ (1, 256] | `avg_fuel_burn_rate`          | 0.296       | ?         |
+| a320n                       | `avg_fuel_burn_rate`          | 0.205       | 103.98    |
+| a320n                       | log(`avg_fuel_burn_rate` + 1) | 0.198       | 98.30     |
+
 ## TODO
 
-- [ ] tackle anomalous data points (sudden jumps in altitude or speed)
+- [ ] `fuel_burn` is quantised (see [data](./data.md)): randomly perturb output by the estimated uncertainty (?)
+- [ ] anomalous data points (sudden jumps in altitude or speed)
 
 third party sources of information
 

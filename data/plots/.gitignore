@@ -1,0 +1,3 @@
+preprocessed_trajectories/*
+# predictions/*
+# dataloader*.png

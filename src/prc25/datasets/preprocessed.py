@@ -1,20 +1,27 @@
 from __future__ import annotations
 
+import json
 import logging
-from typing import TYPE_CHECKING
+import multiprocessing
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal, TypedDict, get_args
 
 import numpy as np
 import polars as pl
 from rich.progress import track
 
-from .. import PATH_PREPROCESSED
+from .. import PATH_PREPROCESSED, Partition
 from . import raw
 
 if TYPE_CHECKING:
     from datetime import datetime
-    from typing import Literal
+    from multiprocessing.synchronize import Event
+    from typing import TypeAlias
 
 logger = logging.getLogger(__name__)
+AcType: TypeAlias = str
+Feature = Literal["time_since_takeoff", "log_dt_1", "altitude", "groundspeed", "vertical_rate"]
+FEATURES = get_args(Feature)
 
 
 def _np_interpolate(y: np.ndarray, x: np.ndarray) -> np.ndarray:
@@ -24,7 +31,7 @@ def _np_interpolate(y: np.ndarray, x: np.ndarray) -> np.ndarray:
     return np.interp(x, x[valid_mask], y[valid_mask])
 
 
-def create_preprocessed(partition: Literal["train", "rank"]):
+def make_trajectories(partition: Partition):
     PATH_PREPROCESSED.mkdir(exist_ok=True, parents=True)
 
     flight_list_lf = raw.scan_flight_list(partition)
@@ -33,21 +40,19 @@ def create_preprocessed(partition: Literal["train", "rank"]):
     segments_df = flight_list_lf.join(fuel_lf, on="flight_id").sort("flight_id").collect()
     logger.info(f"found {len(segments_df)} segments in partition `{partition}`")
 
-    processed_trajectories: list[pl.DataFrame] = []
+    processed_trajectories: list[pl.LazyFrame] = []
 
+    flight_groups = list(segments_df.group_by("flight_id"))
     for (flight_id,), segments in track(
-        segments_df.group_by("flight_id"),
+        flight_groups,
         description="processing flights",
+        total=len(flight_groups),
     ):
         traj_lf = raw.scan_trajectory(flight_id, partition)
-        if traj_lf is None:
-            logger.warning(f"skipped flight_id: {flight_id} (no trajectory found)")
-            continue
+        assert traj_lf is not None
 
         full_traj_df = traj_lf.sort("timestamp").collect()
-        if full_traj_df.height < 2:
-            logger.warning(f"skipped flight_id: {flight_id} (insufficient data points)")
-            continue
+        assert full_traj_df.height > 2
 
         timestamp_s = full_traj_df["timestamp"].dt.epoch(time_unit="s").to_numpy()
         alt_raw = full_traj_df["altitude"].to_numpy()
@@ -87,27 +92,34 @@ def create_preprocessed(partition: Literal["train", "rank"]):
             )
 
         takeoff_time: datetime = segments.select(pl.col("takeoff").first()).item()
-        aircraft_type: str = segments.select(pl.col("aircraft_type").first()).item()
 
         final_df = (
             processed_traj_df.lazy()
             .with_columns(
                 pl.lit(flight_id).alias("flight_id"),
-                pl.lit(aircraft_type).alias("aircraft_type"),
                 segment_expr.alias("segment_id"),
                 (
                     (pl.col("timestamp") - takeoff_time)
                     .dt.total_seconds(fractional=True)
                     .alias("time_since_takeoff")
                 ),
-                pl.col("timestamp").diff().dt.total_seconds(fractional=True).alias("dt"),
+                (
+                    (
+                        pl.col("timestamp")
+                        .diff()
+                        .dt.total_seconds(fractional=True)
+                        .fill_null(0.0)  # first data point has no dt
+                    )
+                    + 1.0
+                )
+                .log()
+                .alias("log_dt_1"),
             )
             .select(
                 "flight_id",
-                "aircraft_type",
                 "segment_id",
                 "time_since_takeoff",
-                "dt",
+                "log_dt_1",
                 "altitude",
                 "altitude_is_outlier",
                 "groundspeed",
@@ -115,12 +127,115 @@ def create_preprocessed(partition: Literal["train", "rank"]):
                 "vertical_rate",
                 "vertical_rate_is_outlier",
             )
-            .collect()
         )
         processed_trajectories.append(final_df)
 
-    all_trajectories_df = pl.concat(processed_trajectories)
-
     output_path = PATH_PREPROCESSED / f"trajectories_{partition}.parquet"
-    all_trajectories_df.write_parquet(output_path)
-    logger.info(f"wrote {len(all_trajectories_df)} combined state vectors to {output_path}")
+
+    stop_event = multiprocessing.Event()
+    monitor_process = multiprocessing.Process(
+        target=_monitor_file_size, args=(output_path, stop_event)
+    )
+    monitor_process.start()
+
+    try:
+        pl.concat(processed_trajectories).sink_parquet(output_path)
+    finally:
+        stop_event.set()
+        monitor_process.join()
+
+    logger.info(f"wrote combined state vectors to {output_path}")
+
+
+def _monitor_file_size(path: Path, stop_event: Event, *, dt: float = 0.2, name: str = "writing"):
+    import time
+
+    from rich.progress import BarColumn, DownloadColumn, Progress, TransferSpeedColumn
+
+    with Progress(
+        "[progress.description]{task.description}",
+        BarColumn(),
+        DownloadColumn(),
+        TransferSpeedColumn(),
+    ) as progress:
+        task = progress.add_task(name, total=None)
+        while not stop_event.is_set():
+            if path.exists():
+                size = path.stat().st_size
+                progress.update(task, completed=size)
+            time.sleep(dt)
+
+
+class Stat(TypedDict):
+    mean: float
+    std: float
+
+
+class SplitData(TypedDict):
+    train_flight_ids: list[str]
+    validation_flight_ids: list[str]
+    standardisation_stats: dict[Feature, Stat]
+
+
+def make_train_validation_split(
+    partition: Partition,
+    train_split: float = 0.9,
+    seed: int = 13,
+):
+    flight_list_lf = raw.scan_flight_list(partition)
+    fuel_lf = raw.scan_fuel(partition)
+
+    flight_ids = (
+        flight_list_lf.join(fuel_lf, on="flight_id")
+        .select("flight_id")
+        .unique()
+        .collect()["flight_id"]
+        .shuffle(seed=seed)
+        .to_list()
+    )
+
+    split_idx = int(len(flight_ids) * train_split)
+    flight_ids_train = flight_ids[:split_idx]
+    flight_ids_validation = flight_ids[split_idx:]
+
+    traj_lf = pl.scan_parquet(PATH_PREPROCESSED / f"trajectories_{partition}.parquet")
+
+    train_segments_lf = traj_lf.filter(
+        pl.col("flight_id").is_in(flight_ids_train) & pl.col("segment_id").is_not_null()
+    )
+
+    stats_df = train_segments_lf.select(
+        [pl.mean(col).alias(f"{col}_mean") for col in FEATURES]
+        + [pl.std(col).alias(f"{col}_std") for col in FEATURES]
+    ).collect()
+
+    standardisation_stats: dict[Feature, Stat] = {}
+    row = stats_df.row(0, named=True)
+    for feature in FEATURES:
+        standardisation_stats[feature] = {
+            "mean": row[f"{feature}_mean"],
+            "std": row[f"{feature}_std"],
+        }
+
+    split_data: SplitData = {
+        "train_flight_ids": flight_ids_train,
+        "validation_flight_ids": flight_ids_validation,
+        "standardisation_stats": standardisation_stats,
+    }
+
+    output_path = PATH_PREPROCESSED / f"split_{partition}.json"
+    with open(output_path, "w") as f:
+        json.dump(split_data, f, indent=2)
+    logger.info(f"wrote split and stats to {output_path}")
+
+
+#
+# wrappers
+#
+
+
+def train_validation_split(
+    partition: Partition,
+) -> SplitData:
+    with open(PATH_PREPROCESSED / f"split_{partition}.json") as f:
+        return json.load(f)  # type: ignore

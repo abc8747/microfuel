@@ -3,11 +3,11 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from typing import Literal, TypedDict
+from typing import TypedDict
 
 import polars as pl
 
-from .. import PATH_DATA, PATH_DATA_RAW
+from .. import PATH_DATA, PATH_DATA_RAW, Partition
 
 
 class Config(TypedDict):
@@ -57,10 +57,8 @@ def download_from_s3(
 # wrappers
 #
 
-Partition = Literal["train", "rank"] | str
 
-
-def scan_fuel(partition: Partition = "train") -> pl.LazyFrame:
+def scan_fuel(partition: Partition = "phase1") -> pl.LazyFrame:
     filename = (
         "fuel_rank_submission.parquet" if partition == "rank" else f"fuel_{partition}.parquet"
     )
@@ -68,7 +66,7 @@ def scan_fuel(partition: Partition = "train") -> pl.LazyFrame:
     return pl.scan_parquet(fp)
 
 
-def scan_flight_list(partition: Partition = "train") -> pl.LazyFrame:
+def scan_flight_list(partition: Partition = "phase1") -> pl.LazyFrame:
     filename = f"flight_list_{partition}.parquet"
     fp = PATH_DATA_RAW / filename
     return pl.scan_parquet(fp)
@@ -79,16 +77,16 @@ def scan_airports() -> pl.LazyFrame:
     return pl.scan_parquet(fp)
 
 
-def scan_all_trajectories(partition: Partition = "train") -> pl.LazyFrame:
+def scan_all_trajectories(partition: Partition = "phase1") -> pl.LazyFrame:
     path = PATH_DATA_RAW / f"flights_{partition}"
     return pl.scan_parquet(f"{path}/*.parquet")
 
 
-def fp_trajectory(flight_id: str, partition: str = "train") -> Path:
+def fp_trajectory(flight_id: str, partition: Partition = "phase1") -> Path:
     return PATH_DATA_RAW / f"flights_{partition}" / f"{flight_id}.parquet"
 
 
-def scan_trajectory(flight_id: str, partition: str = "train") -> pl.LazyFrame | None:
+def scan_trajectory(flight_id: str, partition: Partition = "phase1") -> pl.LazyFrame | None:
     fp = fp_trajectory(flight_id, partition)
     if not fp.exists():
         return None

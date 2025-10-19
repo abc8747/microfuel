@@ -10,6 +10,7 @@ readme = "README.md"
 license = "GPL-3.0-or-later"
 requires-python = ">=3.10"
 dependencies = [
+    "flash-linear-attention>=0.3.2",
     "polars>=1.34",
     "rich>=14",
     "tomli>=2 ; python_full_version < '3.11'",
@@ -21,6 +22,7 @@ plots = ["matplotlib>=3.10", "networkx[default]>=3.4.2"]
 
 [dependency-groups]
 docs = ["mkdocs-material[imaging]>=9.6.14", "mkdocstrings-python>=1.16.11"]
+wandb = ["wandb>=0.22.2"]
 wrangler = ["ipykernel>=6.30.1", "pandas>=2.3.3"]
 
 [tool.ruff]
