@@ -644,20 +644,33 @@ def _plot_dist_cdf(ax: Axes, y_true: np.ndarray, y_pred: np.ndarray, unit: str):
     ax.set_xscale("log")
 
 
-def _plot_mae_cdf(ax: Axes, mae: np.ndarray, unit: str):
+def _plot_rmse_cdf_by_actype(ax: Axes, df: pl.DataFrame, error_col: str, unit: str):
     import numpy as np
+    import polars as pl
 
-    mean_mae = np.mean(mae)
-    sorted_mae = np.sort(mae)
-    cdf = np.arange(1, len(sorted_mae) + 1) / len(sorted_mae) * 100
-    ax.plot(sorted_mae, cdf, linewidth=2)
-    ax.axvline(mean_mae, c="black", lw=1, label=f"Mean MAE: {mean_mae:.4f}")
-    ax.set_xlabel(f"MAE ({unit})")
+    df = df.with_columns((pl.col(error_col) ** 2).alias("se"))
+
+    grouped = (
+        df.group_by("aircraft_type")
+        .agg(pl.col(error_col).alias("errors"), pl.mean("se").sqrt().alias("rmse"))
+        .sort("rmse")
+    )
+
+    for row in grouped.iter_rows(named=True):
+        ac_type = row["aircraft_type"]
+        rmse = row["rmse"]
+        errors = np.sort(row["errors"])
+        cdf = np.arange(1, len(errors) + 1) / len(errors) * 100
+
+        ax.plot(errors, cdf, linewidth=2, label=f"{ac_type} (RMSE: {rmse:.4f})")
+
+    ax.set_xlabel(f"Absolute Error ({unit})")
     ax.set_ylabel("Cumulative Frequency (%)")
     ax.set_ylim(0, 100)
-    ax.legend()
+    ax.legend(fontsize="small")
     ax.grid(True, alpha=0.3)
     ax.set_xscale("log")
+    ax.set_title("CDF of Absolute Error by Aircraft Type")
 
 
 @app.command()
@@ -674,6 +687,7 @@ def predictions(
     preds_df = pl.read_parquet(predictions_path)
     fuel_lf = raw.scan_fuel(partition)
     traj_lf = pl.scan_parquet(PATH_PREPROCESSED / f"trajectories_{partition}.parquet")
+    flight_list_lf = raw.scan_flight_list(partition)
 
     segment_info_lf = (
         fuel_lf.with_columns(duration_s=(pl.col("end") - pl.col("start")).dt.total_seconds())
@@ -685,7 +699,8 @@ def predictions(
             left_on="idx",
             right_on="segment_id",
         )
-        .select("idx", "duration_s", "seq_len")
+        .join(flight_list_lf.select("flight_id", "aircraft_type"), on="flight_id")
+        .select("idx", "duration_s", "seq_len", "aircraft_type")
     )
 
     plot_df = preds_df.join(segment_info_lf.collect(), left_on="segment_id", right_on="idx")
@@ -701,9 +716,9 @@ def predictions(
 
     y_pred_rate, y_true_rate = plot_df.select(["y_pred", "y_true"]).to_numpy().T
     y_pred_kg, y_true_kg = plot_df.select(["y_pred_kg", "y_true_kg"]).to_numpy().T
+    duration_s = plot_df["duration_s"].to_numpy()
     mae_rate = plot_df["mae_rate"].to_numpy()
     mae_kg = plot_df["mae_kg"].to_numpy()
-    duration_s = plot_df["duration_s"].to_numpy()
 
     fig, axes = plt.subplots(4, 2, figsize=(16, 24))
 
@@ -716,8 +731,8 @@ def predictions(
     _plot_dist_cdf(axes[2, 0], y_true_rate, y_pred_rate, "kg/s")
     _plot_dist_cdf(axes[2, 1], y_true_kg, y_pred_kg, "kg")
 
-    _plot_mae_cdf(axes[3, 0], mae_rate, "kg/s")
-    _plot_mae_cdf(axes[3, 1], mae_kg, "kg")
+    _plot_rmse_cdf_by_actype(axes[3, 0], plot_df, "mae_rate", "kg/s")
+    _plot_rmse_cdf_by_actype(axes[3, 1], plot_df, "mae_kg", "kg")
 
     fig.tight_layout(h_pad=4.0)
 

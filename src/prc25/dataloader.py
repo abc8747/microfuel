@@ -32,8 +32,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-Sequence = namedtuple("Sequence", ["features", "target", "segment_id"])
-VarlenBatch = namedtuple("VarlenBatch", ["x", "y", "offsets", "segment_ids"])
+Sequence = namedtuple("Sequence", ["features", "target", "segment_id", "aircraft_type_idx"])
+VarlenBatch = namedtuple("VarlenBatch", ["x", "y", "offsets", "segment_ids", "aircraft_type_idx"])
 
 
 def get_split_flight_ids(partition: Partition, split: Split) -> list[str]:
@@ -57,7 +57,6 @@ def build_feature_dataframe(
     flight_ids: list[str],
     min_seq_len: int,
     max_seq_len: int,
-    aircraft_type: str,
 ) -> pl.DataFrame:
     traj_lf = pl.scan_parquet(PATH_PREPROCESSED / f"trajectories_{partition}.parquet").filter(
         pl.col("flight_id").is_in(flight_ids)
@@ -75,16 +74,14 @@ def build_feature_dataframe(
         flight_list_lf.select("flight_id", "aircraft_type"), on="flight_id"
     )
     valid_segments_lf = (
-        traj_with_actype_lf.filter(
-            (pl.col("aircraft_type") == aircraft_type) & pl.col("segment_id").is_not_null()
-        )
+        traj_with_actype_lf.filter(pl.col("segment_id").is_not_null())
         .group_by(["flight_id", "segment_id"])
         .len()
         .filter(pl.col("len").is_between(min_seq_len, max_seq_len))
     )
 
     final_data_df = (
-        traj_lf.join(valid_segments_lf, on=["flight_id", "segment_id"])
+        traj_with_actype_lf.join(valid_segments_lf, on=["flight_id", "segment_id"])
         .join(
             fuel_with_target_lf,
             left_on=["flight_id", "segment_id"],
@@ -94,6 +91,7 @@ def build_feature_dataframe(
         .select(
             "flight_id",
             "segment_id",
+            "aircraft_type",
             *preprocessed.FEATURES,
             "log_avg_fuel_burn_rate_kg_s_p1",
         )
@@ -103,10 +101,15 @@ def build_feature_dataframe(
 
 
 def create_sequences_from_dataframe(
-    df: pl.DataFrame, means: np.ndarray, stds: np.ndarray
+    df: pl.DataFrame, means: np.ndarray, stds: np.ndarray, ac_type_vocab: dict[str, int]
 ) -> list[Sequence]:
     if df.is_empty():
         return []
+    df = df.with_columns(
+        pl.col("aircraft_type")
+        .map_elements(lambda x: ac_type_vocab.get(x, ac_type_vocab["UNK"]), return_dtype=pl.Int32)
+        .alias("aircraft_type_idx")
+    )
     return [
         Sequence(
             features=(
@@ -115,6 +118,7 @@ def create_sequences_from_dataframe(
             / stds,
             target=group.select("log_avg_fuel_burn_rate_kg_s_p1").item(0, 0),
             segment_id=key[1],
+            aircraft_type_idx=group.select("aircraft_type_idx").item(0, 0),
         )
         for key, group in df.group_by(["flight_id", "segment_id"], maintain_order=True)
     ]
@@ -126,20 +130,32 @@ class VarlenDataset(Dataset):
         partition: Partition,
         split: Split,
         min_seq_len: int = 2,
-        max_seq_len: int = 256,
-        aircraft_type: str = "A20N",
+        max_seq_len: int = 65536,
     ):
         flight_ids = get_split_flight_ids(partition, split)
         self.means, self.stds = get_standardisation_stats(partition)
 
-        final_data_df = build_feature_dataframe(
-            partition, flight_ids, min_seq_len, max_seq_len, aircraft_type
+        train_flight_ids = get_split_flight_ids(partition, "train")
+        flight_list_lf = raw.scan_flight_list(partition)
+        ac_types = (
+            flight_list_lf.filter(pl.col("flight_id").is_in(train_flight_ids))
+            .select("aircraft_type")
+            .unique()
+            .sort("aircraft_type")
+            .collect()["aircraft_type"]
+            .to_list()
         )
+        self.ac_type_vocab = {ac_type: i for i, ac_type in enumerate(ac_types)}
+        self.ac_type_vocab["UNK"] = len(self.ac_type_vocab)
+
+        final_data_df = build_feature_dataframe(partition, flight_ids, min_seq_len, max_seq_len)
 
         if final_data_df.is_empty():
             logger.warning(f"no valid data for {partition=}, {split=}")
 
-        self.sequences = create_sequences_from_dataframe(final_data_df, self.means, self.stds)
+        self.sequences = create_sequences_from_dataframe(
+            final_data_df, self.means, self.stds, self.ac_type_vocab
+        )
 
     def __len__(self) -> int:
         return len(self.sequences)
@@ -155,5 +171,10 @@ def collate_fn(batch_sequences: list[Sequence]) -> VarlenBatch:
     y = torch.tensor([seq.target for seq in batch_sequences], dtype=torch.float32).unsqueeze(1)
     offsets = torch.from_numpy(np.cumsum([0, *lengths], dtype=np.int32))
     segment_ids = torch.tensor([seq.segment_id for seq in batch_sequences], dtype=torch.int32)
+    aircraft_type_idx = torch.tensor(
+        [seq.aircraft_type_idx for seq in batch_sequences], dtype=torch.long
+    )
 
-    return VarlenBatch(x=x, y=y, offsets=offsets, segment_ids=segment_ids)
+    return VarlenBatch(
+        x=x, y=y, offsets=offsets, segment_ids=segment_ids, aircraft_type_idx=aircraft_type_idx
+    )

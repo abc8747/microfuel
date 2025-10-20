@@ -29,27 +29,33 @@ This simplifies the problem to a sequence-to-scalar regression task, avoiding di
 To explicitly handle the irregular sampling, each input vector $x_i \in \mathbb{R}^{D+2}$ is an augmentation of the raw observation $o_i$ with two temporal features:
 
 1. Time since takeoff ($\tau_i = t_i - t_{\text{takeoff}}$) for global temporal context.
-2. Log-transformed time since the previous observation. The time gaps $\Delta t_i = t_i - t_{i-1}$ exhibit a long-tail distribution, spanning from seconds to hours - we use log transformation to stabilise training. For the first observation in the segment ($i=1$), we set $\Delta t_1 = 0$.
+2. (deprecated) Time since the previous observation. The time gaps $\Delta t_i = t_i - t_{i-1}$ exhibit a long-tail distribution, spanning from seconds to hours - we drop it for now.
 
 The final input vector at step $i$ is the concatenation:
 
 $$
-x_i = [o_i, \tau_i, \log(\Delta t_i + 1)]
+x_i = [o_i, \tau_i, \text{aircraft\_type}]
 $$
 
 where $o_i$ are observations.
 
 We use a **single layer** Gated DeltaNet, a linear RNN that processes the input sequence $X$ to update its hidden state matrix $S_t \in \mathbb{R}^{d_v \times d_k}$. The state transition from $t-1$ to $t$ is governed by the gated delta rule, a Householder-like transformation:
 
+The aircraft type enum is mapped to an embedding table before being passed to the model.
+
 $$
 S_t = S_{t-1} \odot \left( \alpha_t \odot (I - \beta_t k_t k_t^\top) \right) + \beta_t v_t k_t^\top
 $$
 
-| Dataset                     | Target                        | RMSE (kg/s) | RMSE (kg) |
-| --------------------------- | ----------------------------- | ----------- | --------- |
-| a320n, `seq_len` ∈ (1, 256] | `avg_fuel_burn_rate`          | 0.296       | ?         |
-| a320n                       | `avg_fuel_burn_rate`          | 0.205       | 103.98    |
-| a320n                       | log(`avg_fuel_burn_rate` + 1) | 0.198       | 98.30     |
+| AC Type | Notes                        | Target                        | RMSE (kg/s) | RMSE (kg) | A20N RMSE (kg/s) | A20N RMSE (kg) |
+| ------- | ---------------------------- | ----------------------------- | ----------- | --------- | ---------------- | -------------- |
+| a320n   | seq len in (1, 256]          | `avg_fuel_burn_rate`          |             |           | 0.296            |                |
+| a320n   | -                            | `avg_fuel_burn_rate`          |             |           | 0.205            | 103.98         |
+| a320n   | -                            | log(`avg_fuel_burn_rate` + 1) |             |           | 0.198            | 98.30          |
+| all     | seq len in (1, 256]          | log(`avg_fuel_burn_rate` + 1) | 0.465       | 254.34    | 0.293            |                |
+| all     | -                            | log(`avg_fuel_burn_rate` + 1) | 0.316       | 167.59    | 0.197            | 95.73          |
+| all     | remove feature `log(dt + 1)` | log(`avg_fuel_burn_rate` + 1) | 0.303       | 163.63    | 0.196            | 96.52          |
+<!-- using two layers did not appreciably improve the RMSE -->
 
 ## TODO
 

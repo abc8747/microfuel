@@ -47,6 +47,8 @@ class FuelBurnPredictorConfig:
     input_dim: int
     hidden_size: int
     num_heads: int
+    num_aircraft_types: int
+    aircraft_embedding_dim: int
 
 
 class FuelBurnPredictor(nn.Module):
@@ -54,6 +56,7 @@ class FuelBurnPredictor(nn.Module):
 
     def __init__(self, cfg: FuelBurnPredictorConfig):
         super().__init__()
+
         self.config = cfg
         key_dim = int(cfg.hidden_size * 0.75)  # as per docstring
         assert key_dim % cfg.num_heads == 0, (
@@ -61,18 +64,31 @@ class FuelBurnPredictor(nn.Module):
         )
         head_dim = key_dim // cfg.num_heads
 
-        self.input_proj = nn.Linear(cfg.input_dim, cfg.hidden_size)
+        self.aircraft_embedding = nn.Embedding(cfg.num_aircraft_types, cfg.aircraft_embedding_dim)
+        self.input_proj = nn.Linear(cfg.input_dim + cfg.aircraft_embedding_dim, cfg.hidden_size)
         self.norm = ZeroCentredRMSNorm(cfg.hidden_size)
         self.gdn = GatedDeltaNet(
             hidden_size=cfg.hidden_size, num_heads=cfg.num_heads, head_dim=head_dim
-        )  # NOTE: gdn.o_norm.weight is not zero-centred so it must not be weight-decayed!
+        )
         self.pooler = VarlenPooler()
         self.regression_head = nn.Linear(cfg.hidden_size, 1)
 
-    def forward(self, x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, offsets: torch.Tensor, aircraft_type_idx: torch.Tensor
+    ) -> torch.Tensor:
+        lengths = offsets[1:] - offsets[:-1]
+        ac_embeddings = self.aircraft_embedding(aircraft_type_idx)
+        ac_embeddings_repeated = torch.repeat_interleave(ac_embeddings, lengths, dim=0)
+
+        x = torch.cat([x, ac_embeddings_repeated], dim=1)
         x = self.input_proj(x)
+
+        residual = x
         x = self.norm(x)
         x, _, _ = self.gdn(x.unsqueeze(0), cu_seqlens=offsets)
-        pooled_x = self.pooler(x.squeeze(0), offsets)
+        x = x.squeeze(0)
+        x = x + residual
+
+        pooled_x = self.pooler(x, offsets)
         y_pred = self.regression_head(pooled_x)
         return y_pred

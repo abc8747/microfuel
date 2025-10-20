@@ -75,12 +75,13 @@ class Checkpoint:
 def train(
     partition: Partition = "phase1",
     batch_size: int = 64,
-    epochs: int = 20,
+    epochs: int = 10,
     lr: float = 4e-4,
     hidden_size: int = 32,
     num_heads: int = 2,
-    project_name: str = "prc25",
-    exp_name: str = "gdn-a20n-v0.0.1+log",
+    aircraft_embedding_dim: int = 8,
+    project_name: str = "prc25-multiac",
+    exp_name: str = "gdn-all_ac-v0.0.1+nologdt",
     evaluate_best: Annotated[
         bool, typer.Option(help="Evaluate the best model on the validation set after training.")
     ] = True,
@@ -101,10 +102,21 @@ def train(
     from prc25.datasets import preprocessed
     from prc25.model import FuelBurnPredictor, FuelBurnPredictorConfig
 
+    train_dataset = VarlenDataset(partition=partition, split="train")
+    train_dataloader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn
+    )
+    val_dataset = VarlenDataset(partition=partition, split="validation")
+    val_dataloader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn
+    )
+
     model_cfg = FuelBurnPredictorConfig(
         input_dim=len(preprocessed.FEATURES),
         hidden_size=hidden_size,
         num_heads=num_heads,
+        num_aircraft_types=len(train_dataset.ac_type_vocab),
+        aircraft_embedding_dim=aircraft_embedding_dim,
     )
     cfg = TrainConfig(
         partition=partition,
@@ -121,15 +133,6 @@ def train(
 
     exp_checkpoint_dir = PATH_CHECKPOINTS / cfg.exp_name
     exp_checkpoint_dir.mkdir(exist_ok=True, parents=True)
-
-    train_dataset = VarlenDataset(partition=cfg.partition, split="train")
-    train_dataloader = DataLoader(
-        train_dataset, batch_size=cfg.batch_size, shuffle=True, collate_fn=collate_fn
-    )
-    val_dataset = VarlenDataset(partition=cfg.partition, split="validation")
-    val_dataloader = DataLoader(
-        val_dataset, batch_size=cfg.batch_size, shuffle=False, collate_fn=collate_fn
-    )
 
     model = FuelBurnPredictor(cfg.model_config)
     total_params = sum(p.numel() for p in model.parameters())
@@ -167,13 +170,14 @@ def train(
                 x: torch.Tensor = data.x.to(device)
                 y_log: torch.Tensor = data.y.to(device)
                 offsets: torch.Tensor = data.offsets.to(device)
+                aircraft_type_idx: torch.Tensor = data.aircraft_type_idx.to(device)
 
                 optimizer.zero_grad()
 
                 with torch.autocast(
                     device_type=device, dtype=torch.bfloat16, enabled=(device == "cuda")
                 ):
-                    y_pred_log = model(x, offsets)
+                    y_pred_log = model(x, offsets, aircraft_type_idx)
                     loss = criterion(y_pred_log, y_log)
 
                 scaler.scale(loss).backward()
@@ -248,16 +252,17 @@ def _run_evaluation(
     with torch.no_grad():
         task = progress.add_task(description, total=len(dataloader))
         for data in dataloader:
-            x, y_log, offsets, segment_ids = (
+            x, y_log, offsets, segment_ids, aircraft_type_idx = (
                 data.x.to(device),
                 data.y.to(device),
                 data.offsets.to(device),
                 data.segment_ids.cpu(),
+                data.aircraft_type_idx.to(device),
             )
             with torch.autocast(
                 device_type=device, dtype=torch.bfloat16, enabled=(device == "cuda")
             ):
-                y_pred_log = model(x, offsets)
+                y_pred_log = model(x, offsets, aircraft_type_idx)
 
             y_pred_orig = torch.exp(y_pred_log) - 1.0
             y_true_orig = torch.exp(y_log) - 1.0
@@ -276,7 +281,7 @@ def _run_evaluation(
         {
             "segment_id": segment_ids_tensor.numpy(),
             "y_true": trues_tensor.numpy(),
-            "y_pred": preds_tensor.to(torch.float32).numpy(),  # polars doesn't support bf16
+            "y_pred": preds_tensor.to(torch.float32).numpy(),
         }
     )
     rmse = torch.sqrt(torch.mean((preds_tensor - trues_tensor) ** 2)).item()

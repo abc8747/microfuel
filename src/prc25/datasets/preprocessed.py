@@ -20,7 +20,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 AcType: TypeAlias = str
-Feature = Literal["time_since_takeoff", "log_dt_1", "altitude", "groundspeed", "vertical_rate"]
+Feature = Literal["time_since_takeoff", "altitude", "groundspeed", "vertical_rate"]
+# NOTE: skipping `dt` since its extremely noisy and hurts model performance
 FEATURES = get_args(Feature)
 
 
@@ -104,22 +105,17 @@ def make_trajectories(partition: Partition):
                     .alias("time_since_takeoff")
                 ),
                 (
-                    (
-                        pl.col("timestamp")
-                        .diff()
-                        .dt.total_seconds(fractional=True)
-                        .fill_null(0.0)  # first data point has no dt
-                    )
-                    + 1.0
-                )
-                .log()
-                .alias("log_dt_1"),
+                    pl.col("timestamp")
+                    .diff()
+                    .dt.total_seconds(fractional=True)
+                    .fill_null(0.0)  # first data point has no dt
+                ).alias("dt"),
             )
             .select(
                 "flight_id",
                 "segment_id",
                 "time_since_takeoff",
-                "log_dt_1",
+                "dt",
                 "altitude",
                 "altitude_is_outlier",
                 "groundspeed",
