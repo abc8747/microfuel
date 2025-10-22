@@ -1,3 +1,2 @@
 *.parquet
-*.json
 !.gitignore

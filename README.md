@@ -27,6 +27,8 @@ uv sync --all-extras
 
 Activate your virtual environment with `. .venv/bin/activate`, alternatively, use `uv run python3 scripts/{FILENAME}.py` to run a particular script.
 
+For `causal-conv1d` support, make sure you have [`nvcc`](https://developer.nvidia.com/cuda-downloads) installed.
+
 This repo does not come with raw data.
 You may want to install the MinIO client (`mc`), necessary for pulling and pushing to OpenSky's S3 bucket.
 

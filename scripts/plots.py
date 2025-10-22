@@ -14,7 +14,7 @@ from rich.logging import RichHandler
 from rich.progress import track
 
 import prc25.plot as p
-from prc25 import PATH_PLOTS_OUTPUT, PATH_PREPROCESSED, Partition
+from prc25 import PATH_PLOTS_OUTPUT, PATH_PREPROCESSED, Partition, Split
 from prc25.datasets import raw
 
 if TYPE_CHECKING:
@@ -314,7 +314,9 @@ def _calculate_time_gaps(lf: pl.LazyFrame) -> pl.Series:
     return (
         lf.sort("flight_id", "timestamp")
         .with_columns(
-            (pl.col("timestamp").diff().over("flight_id").dt.total_seconds()).alias("gap_s")
+            (pl.col("timestamp").diff().over("flight_id").dt.total_seconds(fractional=True)).alias(
+                "gap_s"
+            )
         )
         .select("gap_s")
         .drop_nulls()
@@ -333,11 +335,12 @@ def _plot_cdf(ax: Axes, data: pl.Series, label: str, color: str) -> None:
 def time_gap_cdf() -> None:
     traj_lf = raw.scan_all_trajectories("phase1")
     all_gaps = _calculate_time_gaps(traj_lf)
-    adsb_gaps = _calculate_time_gaps(traj_lf.filter(pl.col("source") == "adsb"))
     acars_gaps = _calculate_time_gaps(traj_lf.filter(pl.col("source") == "acars"))
     fuel_lf = raw.scan_fuel("phase1")
     segment_lengths = (
-        fuel_lf.with_columns((pl.col("end") - pl.col("start")).dt.total_seconds().alias("length_s"))
+        fuel_lf.with_columns(
+            (pl.col("end") - pl.col("start")).dt.total_seconds(fractional=True).alias("length_s")
+        )
         .filter(pl.col("length_s") > 0)
         .collect()["length_s"]
     )
@@ -346,7 +349,6 @@ def time_gap_cdf() -> None:
     fig, ax = plt.subplots(1, 1, figsize=(16, 8))
 
     _plot_cdf(ax, all_gaps, "time gaps (all)", "C0")
-    _plot_cdf(ax, adsb_gaps, "time gaps (adsb)", "C1")
     _plot_cdf(ax, acars_gaps, "time gaps (acars)", "C2")
     _plot_cdf(ax, segment_lengths, "segment lengths (fuel data)", "C3")
 
@@ -359,6 +361,47 @@ def time_gap_cdf() -> None:
     ax.legend()
 
     output_path = PATH_PLOTS_OUTPUT / "distributions.pdf"
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"wrote plot to {output_path}")
+
+
+#
+# preprocessed
+#
+
+
+@app.command()
+def seq_len_cdf(partition: Partition = "phase1") -> None:
+    from prc25 import SPLITS
+    from prc25.datasets import preprocessed
+
+    segment_lengths = []
+    for split in SPLITS:
+        traj_lf = pl.scan_parquet(PATH_PREPROCESSED / f"trajectories_{partition}_{split}.parquet")
+        flight_ids = traj_lf.select("flight_id").unique().collect()["flight_id"].to_list()
+
+        for trajectory in track(
+            preprocessed.TrajectoryIterator(
+                partition, split, flight_ids=flight_ids, start_to_end_only=True
+            ),
+            description=f"collecting segment lengths for {split}",
+        ):
+            segment_lengths.append(len(trajectory.features_df))
+
+    fig = p.default_fig(figsize=(16, 8))
+    ax = fig.add_subplot(111)
+    _plot_cdf(ax, pl.Series(segment_lengths), "sequence length", "C0")
+
+    ax.set_xscale("log")
+    ax.set_ylim(0, 100)
+    ax.set_xlabel("Sequence Length")
+    ax.set_ylabel("Cumulative Frequency (%)")
+    ax.grid(True, which="both", linewidth=0.5)
+    ax.xaxis.set_major_formatter(ScalarFormatter())
+    ax.legend()
+
+    output_path = PATH_PLOTS_OUTPUT / "seq_len_cdf.pdf"
     fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
     logger.info(f"wrote plot to {output_path}")
@@ -426,8 +469,8 @@ def preprocessed_trajectories(
             ax1.axvspan(start, end, alpha=0.2, color=color)
 
             segment_traj = traj_df.filter(pl.col("time_since_takeoff").is_between(start, end))
-            seq_len = end - start
-            label_text = f"{row['idx']}: {segment_traj.height}/{seq_len:.0f}s"
+            duration_s = end - start
+            label_text = f"{row['idx']}: {segment_traj.height}/{duration_s:.0f}s"
 
             ax1.text(
                 (start + end) / 2,
@@ -507,11 +550,11 @@ def dataloader(
     all_x_np = np.concatenate(all_x, axis=0)
     all_y_np = np.concatenate(all_y, axis=0).flatten()
 
-    num_features = len(preprocessed.FEATURES)
+    num_features = len(preprocessed.TRAJECTORY_FEATURES)
     fig_cdf, axes_cdf = plt.subplots(2, (num_features + 1 + 1) // 2, figsize=(20, 10))
     axes_cdf: list[Axes] = axes_cdf.flatten()  # type: ignore
 
-    for i, feature in enumerate(preprocessed.FEATURES):
+    for i, feature in enumerate(preprocessed.TRAJECTORY_FEATURES):
         ax = axes_cdf[i]
         data = all_x_np[:, i]
         sorted_data = np.sort(data)
@@ -551,7 +594,7 @@ def _plot_varlen_batch(ax: Axes, data: VarlenBatch):
 
     x = np.arange(data.x.size(0))
 
-    for i, feature in enumerate(preprocessed.FEATURES):
+    for i, feature in enumerate(preprocessed.TRAJECTORY_FEATURES):
         ax.scatter(x, data.x[:, i].cpu().numpy(), label=feature, s=0.2)
 
     for offset in data.offsets.cpu().numpy():
@@ -677,33 +720,44 @@ def _plot_rmse_cdf_by_actype(ax: Axes, df: pl.DataFrame, error_col: str, unit: s
 def predictions(
     predictions_path: Path,
     partition: Partition = "phase1",
+    split: Split = "validation",
 ):
     import matplotlib.pyplot as plt
     import polars as pl
 
-    from prc25 import PATH_PREPROCESSED
     from prc25.datasets import raw
+    from prc25.datasets.preprocessed import TrajectoryIterator
 
     preds_df = pl.read_parquet(predictions_path)
-    fuel_lf = raw.scan_fuel(partition)
-    traj_lf = pl.scan_parquet(PATH_PREPROCESSED / f"trajectories_{partition}.parquet")
-    flight_list_lf = raw.scan_flight_list(partition)
 
-    segment_info_lf = (
-        fuel_lf.with_columns(duration_s=(pl.col("end") - pl.col("start")).dt.total_seconds())
-        .join(
-            traj_lf.filter(pl.col("segment_id").is_not_null())
-            .group_by("segment_id")
-            .len()
-            .rename({"len": "seq_len"}),
-            left_on="idx",
-            right_on="segment_id",
-        )
-        .join(flight_list_lf.select("flight_id", "aircraft_type"), on="flight_id")
-        .select("idx", "duration_s", "seq_len", "aircraft_type")
+    fuel_lf = raw.scan_fuel(partition)
+    flight_ids = (
+        preds_df.lazy()
+        .join(fuel_lf, left_on="segment_id", right_on="idx")
+        .select("flight_id")
+        .unique()
+        .collect()["flight_id"]
+        .to_list()
     )
 
-    plot_df = preds_df.join(segment_info_lf.collect(), left_on="segment_id", right_on="idx")
+    segment_info_data = []
+    trajectory_iterator = TrajectoryIterator(
+        partition=partition, split=split, flight_ids=flight_ids, start_to_end_only=True
+    )
+    for segment in track(trajectory_iterator, description="gathering segment metadata"):
+        duration_s = (segment.info["end"] - segment.info["start"]).total_seconds()
+        seq_len = len(segment.features_df)
+        segment_info_data.append(
+            {
+                "idx": segment.info["idx"],
+                "duration_s": duration_s,
+                "seq_len": seq_len,
+                "aircraft_type": segment.info["aircraft_type"],
+            }
+        )
+    segment_info_df = pl.DataFrame(segment_info_data)
+
+    plot_df = preds_df.join(segment_info_df, left_on="segment_id", right_on="idx")
 
     plot_df = plot_df.with_columns(
         (pl.col("y_pred") * pl.col("duration_s")).alias("y_pred_kg"),

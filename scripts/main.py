@@ -43,12 +43,12 @@ def create_dataset(
 
 
 @app.command()
-def create_split(
+def create_stats(
     partition: Partition,
 ):
-    from prc25.datasets.preprocessed import make_train_validation_split
+    from prc25.datasets.preprocessed import make_standardisation_stats
 
-    make_train_validation_split(partition=partition)
+    make_standardisation_stats(partition=partition)
 
 
 @dataclass
@@ -112,7 +112,7 @@ def train(
     )
 
     model_cfg = FuelBurnPredictorConfig(
-        input_dim=len(preprocessed.FEATURES),
+        input_dim=len(preprocessed.TRAJECTORY_FEATURES),
         hidden_size=hidden_size,
         num_heads=num_heads,
         num_aircraft_types=len(train_dataset.ac_type_vocab),

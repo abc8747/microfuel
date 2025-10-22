@@ -12,11 +12,38 @@ A successful model must address four key challenges:
 This problem structure allows for two inference paradigms. Given all observations $X_{1:N}$, estimating the state $z(t)$ for $t \in [t_{\text{start}}, t_{\text{end}}]$ can be framed as:
 
 - **Filtering:** Using only past and current data, $p(z(t) | X_{t_i \le t})$. This is a causal approach.
-- **Smoothing:** Using the entire observation history, $p(z(t) | X_{1:N})$. This is more powerful for offline analysis as it uses "future" data (relative to the segment) to correct state estimates, likely yielding a more accurate representation.
+- **Smoothing:** Using the entire observation history, $p(z(t) | X_{1:N})$. This is more powerful for offline analysis as it uses "future" data (relative to the segment) to correct state estimates. But adopting this is less helpful in real-world use cases because we may want to do real-time predictions.
 
 ## `v0.0.1`
 
-This serves as the baseline. For simplicity, we use A20N data only, and discard trajectory information not within $[t_{\text{start}}, t_{\text{end}}]$.
+### Architecture
+
+For this sequence-to-scalar regression task, we directly use a simple **single layer** [Gated DeltaNet](https://arxiv.org/pdf/2412.06464) (GDN) for a baselien. Why:
+
+- standard transformers are powerful but suffer from $O(L^2)$ complexity. GDN is a linear RNN belonging to the family of state space models (SSM) that offers near-linear complexity for both training and inference while approaching the expressivity of transformers.
+- LSTM struggle to capture long-range dependencies due to vanishing gradient. GDN is far more expressive:
+  - Delta Rule: allows model to make targeted corrections to its internal state with each new observation (effectively, fast weight programmer learning key-value associations from the flight history).
+  - Gating: controls how much of the past state is preserved at each step, allowing model to forget information.
+
+### Inputs
+
+For simplicity, we discard trajectory information not within $[t_{\text{start}}, t_{\text{end}}]$.
+
+The input vector at step $i$ is the concatenation:
+
+$$
+x_i = [o_i, \tau_i, \text{Embedding}(\text{aircraft\_type})]
+$$
+
+where $o_i$ are standardised observations and $\tau_i = t_i - t_{\text{takeoff}}$ provides global temporal context.
+
+To explicitly handle the irregular sampling, each input vector $x_i \in \mathbb{R}^{D+1}$ is an augmentation of the raw observation $o_i$ with the time since takeoff $\tau_i = t_i = t_{\text{takeoff}}$ for global temporal context.
+
+The time gaps $\Delta t_i = t_i - t_{i-1}$ exhibit a long-tail distribution, spanning from seconds to hours. While including $\log(t_i + 1)$ might help the model, dropping it altogether seemed to improve performance. Using [`time2vec`](https://arxiv.org/abs/1907.05321) on time since takeoff $\tau_i$ seemed to harm performance.
+<!-- we already use use_short_conv=True (see fla/layers/gated_deltanet.py) -->
+<!-- we already do L2 normalisation on query and key (see fla/ops/gated_delta_rule/chunk.py::use_qk_l2norm_in_kernel) -->
+
+### Outputs
 
 To handle the positive-only, long-tailed distribution of the average fuel burn rate, we predict its log-transformed value. The target variable is:
 
@@ -24,47 +51,37 @@ $$
 y = \log\left(\frac{\text{fuel\_kg}}{t_{\text{end}} - t_{\text{start}}} + 1\right)
 $$
 
-This simplifies the problem to a sequence-to-scalar regression task, avoiding direct integration of the instantaneous burn rate $\dot{m}_f(t)$.
-
-To explicitly handle the irregular sampling, each input vector $x_i \in \mathbb{R}^{D+2}$ is an augmentation of the raw observation $o_i$ with two temporal features:
-
-1. Time since takeoff ($\tau_i = t_i - t_{\text{takeoff}}$) for global temporal context.
-2. (deprecated) Time since the previous observation. The time gaps $\Delta t_i = t_i - t_{i-1}$ exhibit a long-tail distribution, spanning from seconds to hours - we drop it for now.
-
-The final input vector at step $i$ is the concatenation:
-
-$$
-x_i = [o_i, \tau_i, \text{aircraft\_type}]
-$$
-
-where $o_i$ are observations.
-
-We use a **single layer** Gated DeltaNet, a linear RNN that processes the input sequence $X$ to update its hidden state matrix $S_t \in \mathbb{R}^{d_v \times d_k}$. The state transition from $t-1$ to $t$ is governed by the gated delta rule, a Householder-like transformation:
-
-The aircraft type enum is mapped to an embedding table before being passed to the model.
-
-$$
-S_t = S_{t-1} \odot \left( \alpha_t \odot (I - \beta_t k_t k_t^\top) \right) + \beta_t v_t k_t^\top
-$$
+which is pooled from the last token of the GDN.This simplifies the problem to a sequence-to-scalar regression task, avoiding direct integration of the instantaneous burn rate $\dot{m}_f(t)$.
 
 | AC Type | Notes                        | Target                        | RMSE (kg/s) | RMSE (kg) | A20N RMSE (kg/s) | A20N RMSE (kg) |
 | ------- | ---------------------------- | ----------------------------- | ----------- | --------- | ---------------- | -------------- |
-| a320n   | seq len in (1, 256]          | `avg_fuel_burn_rate`          |             |           | 0.296            |                |
-| a320n   | -                            | `avg_fuel_burn_rate`          |             |           | 0.205            | 103.98         |
+| a320n   | seq len in (1, 256]          | `avg_fuel_burn_rate`          |             |           | 0.296¹           |                |
+| a320n   | -                            | ..                            |             |           | 0.205            | 103.98         |
 | a320n   | -                            | log(`avg_fuel_burn_rate` + 1) |             |           | 0.198            | 98.30          |
-| all     | seq len in (1, 256]          | log(`avg_fuel_burn_rate` + 1) | 0.465       | 254.34    | 0.293            |                |
-| all     | -                            | log(`avg_fuel_burn_rate` + 1) | 0.316       | 167.59    | 0.197            | 95.73          |
-| all     | remove feature `log(dt + 1)` | log(`avg_fuel_burn_rate` + 1) | 0.303       | 163.63    | 0.196            | 96.52          |
-<!-- using two layers did not appreciably improve the RMSE -->
+| all     | seq len in (1, 256]          | ..                            | 0.465¹      | 254.34¹   | 0.293¹           |                |
+| all     | -                            | ..                            | 0.316       | 167.59    | 0.197            | 95.73          |
+| all     | remove feature `log(dt + 1)` | ..                            | 0.303       | 163.63    | 0.196            | 96.52          |
+
+- using log of target improves performance slightly.
+- ¹ these values refer to sequence length <= 256 and should not be compared directly with the other runs
+- loss spikes are crazy, possibly due to `fuel_burn` quantisation?
 
 ## TODO
 
-- [ ] `fuel_burn` is quantised (see [data](./data.md)): randomly perturb output by the estimated uncertainty (?)
-- [ ] anomalous data points (sudden jumps in altitude or speed)
+- model is biased towards short segments - loss shold be `error * duration ^ 2`
+- model has to compress everything, switch to mean pooling?
+- use `is_outlier` bool flags (check missingness first)
+- learning rate scheduling: warm up, hold at peak LR, then decay (cosine?)
+- train on the entire flight (add `is_in_segment` or add `start`/`end` directly to the features)
+- stack more layers with residual connections and rmsnorm between (though preliminary tests yield negligible improvements, maybe revisit when we train on the entire flight where the model has to compress information)
+- `fuel_burn` is quantised (see [data](./data.md)): also predict absolute uncertainty, but is this really needed? (gaussian_nll_loss probably isn't relevant)
+- staged training: train on short sequences first -> longer sequences
+- improve input projection.
+- gradient clipping
 
-third party sources of information
+data augmentation
 
-- [ ] google-arco era5 for isa deviation, GS -> TAS conversion, temperature, pressure
-- [ ] kinematic features ($p, q, r$, $\dot{x}, \dot{y}, \dot{z}$)
-- [ ] specific energy (potential + kinetic)
-- [ ] <https://github.com/DGAC/Acropole>
+- implement kalman filter
+- kinematic features ($p, q, r$, $\dot{x}, \dot{y}, \dot{z}$) and specific energy
+- google-arco era5: temperature, pressure and uv at fligh level; isa deviation, GS -> TAS conversion, dynamic pressure
+- <https://github.com/DGAC/Acropole> - maybe use their final layer outputs?
