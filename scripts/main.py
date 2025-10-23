@@ -81,7 +81,7 @@ def train(
     num_heads: int = 2,
     aircraft_embedding_dim: int = 8,
     project_name: str = "prc25-multiac",
-    exp_name: str = "gdn-all_ac-v0.0.1+nologdt",
+    exp_name: str = "gdn-all_ac-v0.0.2",
     evaluate_best: Annotated[
         bool, typer.Option(help="Evaluate the best model on the validation set after training.")
     ] = True,
@@ -141,7 +141,7 @@ def train(
         logger.info(f"  {name:<25} {tuple(param.shape)!s:<15} {param.numel():,}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
-    criterion = torch.nn.MSELoss()
+    criterion = torch.nn.MSELoss(reduction="none")
 
     wandb.init(project=cfg.project_name, name=cfg.exp_name, config=asdict(cfg))
     wandb.watch(model, log="all", log_freq=100)
@@ -171,6 +171,7 @@ def train(
                 y_log: torch.Tensor = data.y.to(device)
                 offsets: torch.Tensor = data.offsets.to(device)
                 aircraft_type_idx: torch.Tensor = data.aircraft_type_idx.to(device)
+                durations: torch.Tensor = data.durations.to(device)
 
                 optimizer.zero_grad()
 
@@ -178,19 +179,23 @@ def train(
                     device_type=device, dtype=torch.bfloat16, enabled=(device == "cuda")
                 ):
                     y_pred_log = model(x, offsets, aircraft_type_idx)
-                    loss = criterion(y_pred_log, y_log)
+                    loss_unweighted = criterion(y_pred_log, y_log)
+                    loss = (loss_unweighted * durations.unsqueeze(1)).mean()
 
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
 
                 if global_step > 0 and global_step % 25 == 0:
-                    rmse_val, _ = _run_evaluation(
+                    rmse_rate_val, rmse_kg_val, _ = _run_evaluation(
                         model, val_dataloader, device, progress, "validating"
                     )
-                    wandb.log({"rmse_val": rmse_val}, step=global_step)
-                    if rmse_val < best_val_rmse:
-                        best_val_rmse = rmse_val
+                    wandb.log(
+                        {"rmse_rate_val": rmse_rate_val, "rmse_kg_val": rmse_kg_val},
+                        step=global_step,
+                    )
+                    if rmse_kg_val < best_val_rmse:
+                        best_val_rmse = rmse_kg_val
                         checkpoint_path = exp_checkpoint_dir / "best.pt"
                         checkpoint = Checkpoint(
                             model_state_dict=model.state_dict(),
@@ -201,7 +206,7 @@ def train(
                         )
                         torch.save(checkpoint, checkpoint_path)
                         logger.info(
-                            f"new best val rmse: {rmse_val:.4f}, saved to {checkpoint_path}"
+                            f"new best val rmse_rate: {rmse_rate_val:.4f} (rmse_kg: {rmse_kg_val:.2f}), saved to {checkpoint_path}"
                         )
                     model.train()
 
@@ -211,17 +216,24 @@ def train(
                 global_step += 1
 
                 with torch.no_grad():
-                    y_pred_orig = torch.exp(y_pred_log.detach()) - 1.0
-                    y_true_orig = torch.exp(y_log.detach()) - 1.0
-                    rmse_orig = torch.sqrt(
-                        torch.nn.functional.mse_loss(y_pred_orig, y_true_orig)
+                    y_pred_rate_orig = torch.exp(y_pred_log.detach()) - 1.0
+                    y_true_rate_orig = torch.exp(y_log.detach()) - 1.0
+                    rmse_rate_orig = torch.sqrt(
+                        torch.nn.functional.mse_loss(y_pred_rate_orig, y_true_rate_orig)
                     ).item()
-                wandb.log({"rmse_train": rmse_orig}, step=global_step)
+
+                    y_pred_kg = y_pred_rate_orig * durations.unsqueeze(1)
+                    y_true_kg = y_true_rate_orig * durations.unsqueeze(1)
+                    rmse_kg = torch.sqrt(torch.nn.functional.mse_loss(y_pred_kg, y_true_kg)).item()
+                wandb.log(
+                    {"rmse_rate_train": rmse_rate_orig, "rmse_kg_train": rmse_kg},
+                    step=global_step,
+                )
 
                 progress.update(
                     train_task,
                     advance=1,
-                    description=(f"train epoch {epoch + 1}/{cfg.epochs} {rmse_orig=:.4f}"),
+                    description=(f"train epoch {epoch + 1}/{cfg.epochs} rmse_kg={rmse_kg:.2f}"),
                 )
             progress.remove_task(train_task)
 
@@ -242,22 +254,23 @@ def _run_evaluation(
     device: str,
     progress: Progress,
     description: str,
-) -> tuple[float, pl.DataFrame]:
+) -> tuple[float, float, pl.DataFrame]:
     import polars as pl
     import torch
 
     model.eval()
-    all_preds, all_trues, all_segment_ids = [], [], []
+    all_preds, all_trues, all_segment_ids, all_durations = [], [], [], []
 
     with torch.no_grad():
         task = progress.add_task(description, total=len(dataloader))
         for data in dataloader:
-            x, y_log, offsets, segment_ids, aircraft_type_idx = (
+            x, y_log, offsets, segment_ids, aircraft_type_idx, durations = (
                 data.x.to(device),
                 data.y.to(device),
                 data.offsets.to(device),
                 data.segment_ids.cpu(),
                 data.aircraft_type_idx.to(device),
+                data.durations.cpu(),
             )
             with torch.autocast(
                 device_type=device, dtype=torch.bfloat16, enabled=(device == "cuda")
@@ -270,22 +283,35 @@ def _run_evaluation(
             all_preds.append(y_pred_orig.cpu())
             all_trues.append(y_true_orig.cpu())
             all_segment_ids.append(segment_ids)
+            all_durations.append(durations)
             progress.update(task, advance=1)
         progress.remove_task(task)
 
     preds_tensor = torch.cat(all_preds).flatten()
     trues_tensor = torch.cat(all_trues).flatten()
     segment_ids_tensor = torch.cat(all_segment_ids).flatten()
+    durations_tensor = torch.cat(all_durations).flatten()
 
     df = pl.DataFrame(
         {
             "segment_id": segment_ids_tensor.numpy(),
-            "y_true": trues_tensor.numpy(),
-            "y_pred": preds_tensor.to(torch.float32).numpy(),
+            "duration_s": durations_tensor.numpy(),
+            "y_true_rate": trues_tensor.numpy(),
+            "y_pred_rate": preds_tensor.to(torch.float32).numpy(),
         }
     )
-    rmse = torch.sqrt(torch.mean((preds_tensor - trues_tensor) ** 2)).item()
-    return rmse, df
+    df = df.with_columns(
+        (pl.col("y_true_rate") * pl.col("duration_s")).alias("y_true_kg"),
+        (pl.col("y_pred_rate") * pl.col("duration_s")).alias("y_pred_kg"),
+    )
+
+    rmse_rate = torch.sqrt(torch.mean((preds_tensor - trues_tensor) ** 2)).item()
+
+    preds_kg = preds_tensor * durations_tensor
+    trues_kg = trues_tensor * durations_tensor
+    rmse_kg = torch.sqrt(torch.mean((preds_kg - trues_kg) ** 2)).item()
+
+    return rmse_rate, rmse_kg, df
 
 
 @app.command()
@@ -316,7 +342,7 @@ def evaluate(
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
     with Progress() as progress:
-        rmse, df = _run_evaluation(
+        rmse_rate, rmse_kg, df = _run_evaluation(
             model, dataloader, device, progress, f"evaluating on {split} split"
         )
 
@@ -325,7 +351,7 @@ def evaluate(
     output_path = PATH_PREDICTIONS / f"{exp_name}_{split}.parquet"
     df.write_parquet(output_path)
     logger.info(f"wrote predictions to {output_path}")
-    logger.info(f"final rmse on {split=}: {rmse:.4f}")
+    logger.info(f"final rmse on {split=}: rate={rmse_rate:.4f} kg/s, total={rmse_kg:.2f} kg")
 
 
 if __name__ == "__main__":

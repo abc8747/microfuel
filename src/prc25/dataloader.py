@@ -32,8 +32,12 @@ from .datasets.preprocessed import TrajectoryIterator, load_standardisation_stat
 logger = logging.getLogger(__name__)
 
 
-Sequence = namedtuple("Sequence", ["features", "target", "segment_id", "aircraft_type_idx"])
-VarlenBatch = namedtuple("VarlenBatch", ["x", "y", "offsets", "segment_ids", "aircraft_type_idx"])
+Sequence = namedtuple(
+    "Sequence", ["features", "target", "segment_id", "aircraft_type_idx", "duration_s"]
+)
+VarlenBatch = namedtuple(
+    "VarlenBatch", ["x", "y", "offsets", "segment_ids", "aircraft_type_idx", "durations"]
+)
 
 
 class VarlenDataset(Dataset):
@@ -104,6 +108,7 @@ class VarlenDataset(Dataset):
                     target=target,
                     segment_id=trajectory.info["idx"],
                     aircraft_type_idx=ac_type_idx,
+                    duration_s=duration_s,
                 )
             )
 
@@ -124,7 +129,13 @@ def collate_fn(batch_sequences: list[Sequence]) -> VarlenBatch:
     aircraft_type_idx = torch.tensor(
         [seq.aircraft_type_idx for seq in batch_sequences], dtype=torch.long
     )
+    durations = torch.tensor([seq.duration_s for seq in batch_sequences], dtype=torch.float32)
 
     return VarlenBatch(
-        x=x, y=y, offsets=offsets, segment_ids=segment_ids, aircraft_type_idx=aircraft_type_idx
+        x=x,
+        y=y,
+        offsets=offsets,
+        segment_ids=segment_ids,
+        aircraft_type_idx=aircraft_type_idx,
+        durations=durations,
     )
