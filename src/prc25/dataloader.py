@@ -1,19 +1,3 @@
-"""Prepares variable-length batches to predict fuel burn from trajectory data.
-
-We have:
-1. Time series trajectory of a *full flight*.
-2. *Segments* of fuel burn data (discrete intervals with start and end times).
-
-Do NOT pad sequences: our sequences range from 2 to thousands of tokens.
-
-Instead, we concatenate all sequences in the batch into one long tensor and
-provide metadata to tell the kernel where each sequence begins and ends.
-
-The Triton kernels in FLA are specifically designed to be varlen-aware.
-
-See `chunk_bwd_kernel_dqkwg` kernel in `lit_gpt/gated_delta_rule_ops/fla_version/chunk_fla.py`.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -36,7 +20,7 @@ Sequence = namedtuple(
     "Sequence", ["features", "target", "segment_id", "aircraft_type_idx", "duration_s"]
 )
 VarlenBatch = namedtuple(
-    "VarlenBatch", ["x", "y", "offsets", "segment_ids", "aircraft_type_idx", "durations"]
+    "VarlenBatch", ["x", "y", "cu_seqlens", "segment_ids", "aircraft_type_idx", "durations"]
 )
 
 
@@ -102,6 +86,7 @@ class VarlenDataset(Dataset):
                 trajectory.info["aircraft_type"], self.ac_type_vocab["UNK"]
             )
 
+            # collect here to amortise cost, but this is unscalable for full flight datasets.
             self.sequences.append(
                 Sequence(
                     features=features_np,
@@ -124,7 +109,7 @@ def collate_fn(batch_sequences: list[Sequence]) -> VarlenBatch:
 
     x = torch.from_numpy(np.concatenate([seq.features for seq in batch_sequences], axis=0))
     y = torch.tensor([seq.target for seq in batch_sequences], dtype=torch.float32).unsqueeze(1)
-    offsets = torch.from_numpy(np.cumsum([0, *lengths], dtype=np.int32))
+    cu_seqlens = torch.from_numpy(np.cumsum([0, *lengths], dtype=np.int32))
     segment_ids = torch.tensor([seq.segment_id for seq in batch_sequences], dtype=torch.int32)
     aircraft_type_idx = torch.tensor(
         [seq.aircraft_type_idx for seq in batch_sequences], dtype=torch.long
@@ -134,7 +119,7 @@ def collate_fn(batch_sequences: list[Sequence]) -> VarlenBatch:
     return VarlenBatch(
         x=x,
         y=y,
-        offsets=offsets,
+        cu_seqlens=cu_seqlens,
         segment_ids=segment_ids,
         aircraft_type_idx=aircraft_type_idx,
         durations=durations,

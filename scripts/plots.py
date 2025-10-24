@@ -408,6 +408,73 @@ def seq_len_cdf(partition: Partition = "phase1") -> None:
 
 
 @app.command()
+def preprocessed_features_cdf(
+    partition: Partition = "phase1",
+    split: Split = "train",
+):
+    import numpy as np
+    import polars as pl
+    from rich.progress import track
+
+    from prc25.datasets import preprocessed
+    from prc25.datasets.preprocessed import TrajectoryIterator
+
+    traj_lf = pl.scan_parquet(PATH_PREPROCESSED / f"trajectories_{partition}_{split}.parquet")
+    flight_ids = traj_lf.select("flight_id").unique().collect()["flight_id"].to_list()
+
+    iterator = TrajectoryIterator(
+        partition=partition,
+        split=split,
+        flight_ids=flight_ids,
+        start_to_end_only=True,
+    )
+
+    feature_frames: list[pl.DataFrame] = []
+    fuel_kg: list[float] = []
+    for trajectory in track(iterator, description=f"loading {split} data for distributions"):
+        feature_frames.append(trajectory.features_df)
+        fuel_kg.append(trajectory.info["fuel_kg"])
+
+    features_df = pl.concat(feature_frames)
+    fuel_kg_np = np.array(fuel_kg)
+
+    num_features = len(preprocessed.TRAJECTORY_FEATURES)
+    fig_cdf, axes_cdf = plt.subplots(2, (num_features + 1 + 1) // 2, figsize=(20, 10))
+    axes_cdf: list[Axes] = axes_cdf.flatten()  # type: ignore
+
+    for i, feature in enumerate(preprocessed.TRAJECTORY_FEATURES):
+        ax = axes_cdf[i]
+        data = features_df[feature].to_numpy()
+        sorted_data = np.sort(data)
+        cdf = np.arange(1, len(sorted_data) + 1) / len(sorted_data)
+        p1, p5, p50, p95, p99 = np.percentile(data, [1, 5, 50, 95, 99])
+        ax.plot(sorted_data, cdf)
+        ax.axvline(0, color="red", linestyle="--", linewidth=1)
+        ax.set_xlabel("value")
+        ax.set_ylabel("cumulative probability")
+        ax.set_title(f"{feature}\n{p1=:.3f}, {p5=:.3f}, {p50=:.3f}, {p95=:.3f}, {p99=:.3f}")
+        ax.grid(True, alpha=0.3)
+
+    ax_y = axes_cdf[num_features]
+    sorted_y = np.sort(fuel_kg_np)
+    cdf_y = np.arange(1, len(sorted_y) + 1) / len(sorted_y)
+    p1, p5, p50, p95, p99 = np.percentile(fuel_kg_np, [1, 5, 50, 95, 99])
+    ax_y.plot(sorted_y, cdf_y, linewidth=2)
+    ax_y.set_xlabel("value")
+    ax_y.set_ylabel("cumulative probability")
+    ax_y.set_title(f"target\n{p1=:.4f}, {p5=:.4f}, {p50=:.4f}, {p95=:.4f}, {p99=:.4f}")
+    ax_y.grid(True, alpha=0.3)
+
+    for j in range(num_features + 1, len(axes_cdf)):
+        fig_cdf.delaxes(axes_cdf[j])
+
+    output_path_cdf = PATH_PLOTS_OUTPUT / "preprocessed_features_cdf.png"
+    fig_cdf.savefig(output_path_cdf, bbox_inches="tight", dpi=300)
+    plt.close(fig_cdf)
+    logger.info(f"wrote cdf plot to {output_path_cdf}")
+
+
+@app.command()
 def preprocessed_trajectories(
     partition: Partition = "phase1",
     num_flights: int = 100,
@@ -505,7 +572,6 @@ def dataloader(
     from torch.utils.data import DataLoader
 
     from prc25.dataloader import VarlenDataset, collate_fn
-    from prc25.datasets import preprocessed
 
     dataset = VarlenDataset(partition=partition, split=split)  # type: ignore
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
@@ -540,51 +606,6 @@ def dataloader(
     plt.close(fig_batches)
     logger.info(f"wrote batch plot to {output_path_batches}")
 
-    all_x, all_y = [], []
-    for batch in track(dataloader):
-        all_x.append(batch.x.cpu().numpy())
-        all_y.append(batch.y.cpu().numpy())
-
-    assert all_x
-
-    all_x_np = np.concatenate(all_x, axis=0)
-    all_y_np = np.concatenate(all_y, axis=0).flatten()
-
-    num_features = len(preprocessed.TRAJECTORY_FEATURES)
-    fig_cdf, axes_cdf = plt.subplots(2, (num_features + 1 + 1) // 2, figsize=(20, 10))
-    axes_cdf: list[Axes] = axes_cdf.flatten()  # type: ignore
-
-    for i, feature in enumerate(preprocessed.TRAJECTORY_FEATURES):
-        ax = axes_cdf[i]
-        data = all_x_np[:, i]
-        sorted_data = np.sort(data)
-        cdf = np.arange(1, len(sorted_data) + 1) / len(sorted_data)
-        ax.plot(sorted_data, cdf)
-        ax.axvline(0, color="red", linestyle="--", linewidth=1)
-        ax.set_xlabel("value")
-        ax.set_ylabel("cumulative probability")
-        ax.set_title(f"{feature} (standardised)")
-        ax.set_xlim(-2, 2)
-        ax.grid(True, alpha=0.3)
-
-    ax_y = axes_cdf[num_features]
-    all_y_orig_np = np.exp(all_y_np) - 1.0
-    sorted_y = np.sort(all_y_orig_np)
-    cdf_y = np.arange(1, len(sorted_y) + 1) / len(sorted_y)
-    ax_y.plot(sorted_y, cdf_y, linewidth=2)
-    ax_y.set_xlabel("value")
-    ax_y.set_ylabel("cumulative probability")
-    ax_y.set_title("avg_fuel_burn_rate_kg_s")
-    ax_y.grid(True, alpha=0.3)
-
-    for j in range(num_features + 1, len(axes_cdf)):
-        fig_cdf.delaxes(axes_cdf[j])
-
-    output_path_cdf = PATH_PLOTS_OUTPUT / "dataloader_cdf.png"
-    fig_cdf.savefig(output_path_cdf, bbox_inches="tight", dpi=150)
-    plt.close(fig_cdf)
-    logger.info(f"wrote cdf plot to {output_path_cdf}")
-
 
 def _plot_varlen_batch(ax: Axes, data: VarlenBatch):
     import matplotlib.colors as colors
@@ -597,7 +618,7 @@ def _plot_varlen_batch(ax: Axes, data: VarlenBatch):
     for i, feature in enumerate(preprocessed.TRAJECTORY_FEATURES):
         ax.scatter(x, data.x[:, i].cpu().numpy(), label=feature, s=0.2)
 
-    for offset in data.offsets.cpu().numpy():
+    for offset in data.cu_seqlens.cpu().numpy():
         ax.axvline(offset, lw=0.5, color="gray")
 
     y_min, y_max = ax.get_ylim()
@@ -608,9 +629,9 @@ def _plot_varlen_batch(ax: Axes, data: VarlenBatch):
     norm = colors.Normalize(vmin=y_values.min(), vmax=y_values.max())
     cmap = plt.get_cmap("viridis")
 
-    for i in range(len(data.offsets) - 1):
-        start = data.offsets[i].item()
-        end = data.offsets[i + 1].item()
+    for i in range(len(data.cu_seqlens) - 1):
+        start = data.cu_seqlens[i].item()
+        end = data.cu_seqlens[i + 1].item()
         segment_id = data.segment_ids[i].item()
         x_pos = (start + end) / 2
         y = y_values[i]
@@ -632,6 +653,7 @@ def _plot_scatter(ax: Axes, y_true: np.ndarray, y_pred: np.ndarray, title: str, 
     import numpy as np
 
     rmse = np.sqrt(np.mean((y_true - y_pred) ** 2))
+    stderr_rmse = np.std((y_true - y_pred) ** 2) / np.sqrt(len(y_true)) / (2 * rmse)
     ss_res = np.sum((y_true - y_pred) ** 2)
     ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
     r2 = 1 - (ss_res / ss_tot)
@@ -642,7 +664,7 @@ def _plot_scatter(ax: Axes, y_true: np.ndarray, y_pred: np.ndarray, title: str, 
     ax.plot([min_val, max_val], [min_val, max_val], color="black", lw=0.5)
     ax.set_xlabel(f"Actual ({unit})")
     ax.set_ylabel(f"Predicted ({unit})")
-    ax.set_title(f"{title}\nRMSE={rmse:.4f}, R²={r2:.4f}")
+    ax.set_title(f"{title}\nRMSE={rmse:.4f}±{stderr_rmse:.4f}, R²={r2:.4f}")
     ax.grid(True, alpha=0.3)
     ax.set_xscale("log")
     ax.set_yscale("log")
@@ -660,7 +682,7 @@ def _plot_mae_vs_duration(ax: Axes, duration_s: np.ndarray, mae: np.ndarray, uni
     trendline = 10 ** (slope * np.log10(duration_sorted) + intercept)
 
     equation = f"$y = {10**intercept:.4f} x^{{{slope:.4f}}}$"
-    ax.plot(duration_sorted, trendline, "r-", linewidth=2, label=equation)
+    ax.plot(duration_sorted, trendline, "k-", linewidth=0.5, label=equation)
 
     ax.set_xlabel("Segment Duration (s)")
     ax.set_ylabel(f"MAE ({unit})")
@@ -695,17 +717,23 @@ def _plot_rmse_cdf_by_actype(ax: Axes, df: pl.DataFrame, error_col: str, unit: s
 
     grouped = (
         df.group_by("aircraft_type")
-        .agg(pl.col(error_col).alias("errors"), pl.mean("se").sqrt().alias("rmse"))
+        .agg(
+            pl.col(error_col).alias("errors"),
+            pl.mean("se").sqrt().alias("rmse"),
+            pl.std("se").alias("std_se"),
+            pl.len().alias("n"),
+        )
         .sort("rmse")
     )
 
     for row in grouped.iter_rows(named=True):
         ac_type = row["aircraft_type"]
         rmse = row["rmse"]
+        stderr_rmse = row["std_se"] / np.sqrt(row["n"]) / (2 * rmse) if rmse > 0 else 0
         errors = np.sort(row["errors"])
         cdf = np.arange(1, len(errors) + 1) / len(errors) * 100
 
-        ax.plot(errors, cdf, linewidth=2, label=f"{ac_type} (RMSE: {rmse:.4f})")
+        ax.plot(errors, cdf, linewidth=2, label=f"{ac_type} (RMSE: {rmse:.4f}±{stderr_rmse:.4f})")
 
     ax.set_xlabel(f"Absolute Error ({unit})")
     ax.set_ylabel("Cumulative Frequency (%)")
@@ -760,15 +788,11 @@ def predictions(
     plot_df = preds_df.join(segment_info_df, left_on="segment_id", right_on="idx")
 
     plot_df = plot_df.with_columns(
-        (pl.col("y_pred") * pl.col("duration_s")).alias("y_pred_kg"),
-        (pl.col("y_true") * pl.col("duration_s")).alias("y_true_kg"),
-    )
-    plot_df = plot_df.with_columns(
-        (pl.col("y_pred") - pl.col("y_true")).abs().alias("mae_rate"),
+        (pl.col("y_pred_rate") - pl.col("y_true_rate")).abs().alias("mae_rate"),
         (pl.col("y_pred_kg") - pl.col("y_true_kg")).abs().alias("mae_kg"),
     )
 
-    y_pred_rate, y_true_rate = plot_df.select(["y_pred", "y_true"]).to_numpy().T
+    y_pred_rate, y_true_rate = plot_df.select(["y_pred_rate", "y_true_rate"]).to_numpy().T
     y_pred_kg, y_true_kg = plot_df.select(["y_pred_kg", "y_true_kg"]).to_numpy().T
     duration_s = plot_df["duration_s"].to_numpy()
     mae_rate = plot_df["mae_rate"].to_numpy()

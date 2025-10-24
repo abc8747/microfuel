@@ -2,17 +2,19 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 import torch.nn as nn
-from fla.layers import GatedDeltaNet
+from fla.layers import GatedDeltaNet  # see: https://arxiv.org/pdf/2412.06464
 
 logger = logging.getLogger(__name__)
 
 
 class ZeroCentredRMSNorm(nn.Module):
     """Avoids abnormal amplification of some weights in the original QK-norm.
-    During regularization and weight decay, `weight` will be pushed near 0.
+    During regularisation and weight decay, `weight` will be pushed near 0.
+
     See: https://ceramic.ai/blog/zerocentered"""
 
     def __init__(self, hidden_size: int, eps: float = 1e-6):
@@ -28,18 +30,21 @@ class ZeroCentredRMSNorm(nn.Module):
         return (hidden_states * (1.0 + self.weight)).to(input_dtype)
 
 
-class VarlenPooler(nn.Module):
-    def __init__(self):
+class Pooler(nn.Module):
+    def __init__(self, mode: Literal["mean", "last"] = "last"):
         super().__init__()
+        self.mode = mode
 
-    def forward(self, x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
-        pooled_outputs = []
-        for i in range(len(offsets) - 1):
-            start, end = offsets[i], offsets[i + 1]
-            segment = x[start:end]
-            pooled = segment[-1]
-            pooled_outputs.append(pooled)
-        return torch.stack(pooled_outputs)
+    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+        if self.mode == "last":
+            return x[cu_seqlens[1:] - 1]
+        elif self.mode == "mean":
+            indices = torch.arange(x.size(0), device=x.device)
+            return torch.nn.functional.embedding_bag(
+                indices, x, offsets=cu_seqlens[:-1], mode="mean"
+            )
+        else:
+            raise ValueError(f"unknown {self.mode=}")
 
 
 @dataclass
@@ -52,10 +57,24 @@ class FuelBurnPredictorConfig:
 
 
 class FuelBurnPredictor(nn.Module):
-    """Gated Delta Network: https://arxiv.org/pdf/2412.06464"""
+    """Terminology:
+
+    We have three *segments* of the trajectory, which range from 2 to thousands of tokens:
+        - [takeoff, start]
+        - [start, end]: the segment for which we predict fuel burn
+        - [end, arrival]
+
+    This model only processes the [start, end] segment.
+
+    Instead of padding, segments are tightly packed together in a long tensor, and
+    FLA is informed of segment boundaries via the `cu_seqlens` tensor.
+    """
 
     def __init__(self, cfg: FuelBurnPredictorConfig):
         super().__init__()
+        from .hacks import fla_autotuner_check_removed_nb
+
+        fla_autotuner_check_removed_nb()
 
         self.config = cfg
         key_dim = int(cfg.hidden_size * 0.75)  # as per docstring
@@ -70,13 +89,15 @@ class FuelBurnPredictor(nn.Module):
         self.gdn = GatedDeltaNet(
             hidden_size=cfg.hidden_size, num_heads=cfg.num_heads, head_dim=head_dim
         )
-        self.pooler = VarlenPooler()
+        self.pooler = Pooler()
         self.regression_head = nn.Linear(cfg.hidden_size, 1)
 
     def forward(
-        self, x: torch.Tensor, offsets: torch.Tensor, aircraft_type_idx: torch.Tensor
+        self, x: torch.Tensor, cu_seqlens: torch.Tensor, aircraft_type_idx: torch.Tensor
     ) -> torch.Tensor:
-        lengths = offsets[1:] - offsets[:-1]
+        """:param x: Packed tensor
+        :param cu_seqlens: Cumulative sequence lengths for packed tensor"""
+        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
         ac_embeddings = self.aircraft_embedding(aircraft_type_idx)
         ac_embeddings_repeated = torch.repeat_interleave(ac_embeddings, lengths, dim=0)
 
@@ -85,10 +106,10 @@ class FuelBurnPredictor(nn.Module):
 
         residual = x
         x = self.norm(x)
-        x, _, _ = self.gdn(x.unsqueeze(0), cu_seqlens=offsets)
+        x, _, _ = self.gdn(x.unsqueeze(0), cu_seqlens=cu_seqlens)
         x = x.squeeze(0)
         x = x + residual
 
-        pooled_x = self.pooler(x, offsets)
+        pooled_x = self.pooler(x, cu_seqlens)
         y_pred = self.regression_head(pooled_x)
         return y_pred

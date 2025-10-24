@@ -76,7 +76,7 @@ def train(
     partition: Partition = "phase1",
     batch_size: int = 64,
     epochs: int = 10,
-    lr: float = 4e-4,
+    lr: float = 3e-4,
     hidden_size: int = 32,
     num_heads: int = 2,
     aircraft_embedding_dim: int = 8,
@@ -97,6 +97,9 @@ def train(
     )
     from torch.utils.data import DataLoader
 
+    from prc25.hacks import fla_autotuner_remove_nb
+
+    fla_autotuner_remove_nb()
     import wandb
     from prc25.dataloader import VarlenDataset, collate_fn
     from prc25.datasets import preprocessed
@@ -169,7 +172,7 @@ def train(
             for data in train_dataloader:
                 x: torch.Tensor = data.x.to(device)
                 y_log: torch.Tensor = data.y.to(device)
-                offsets: torch.Tensor = data.offsets.to(device)
+                cu_seqlens: torch.Tensor = data.cu_seqlens.to(device)
                 aircraft_type_idx: torch.Tensor = data.aircraft_type_idx.to(device)
                 durations: torch.Tensor = data.durations.to(device)
 
@@ -178,7 +181,7 @@ def train(
                 with torch.autocast(
                     device_type=device, dtype=torch.bfloat16, enabled=(device == "cuda")
                 ):
-                    y_pred_log = model(x, offsets, aircraft_type_idx)
+                    y_pred_log = model(x, cu_seqlens, aircraft_type_idx)
                     loss_unweighted = criterion(y_pred_log, y_log)
                     loss = (loss_unweighted * durations.unsqueeze(1)).mean()
 
@@ -206,7 +209,7 @@ def train(
                         )
                         torch.save(checkpoint, checkpoint_path)
                         logger.info(
-                            f"new best val rmse_rate: {rmse_rate_val:.4f} (rmse_kg: {rmse_kg_val:.2f}), saved to {checkpoint_path}"
+                            f"wrote {checkpoint_path}: best {rmse_kg_val=:.2f} ({rmse_rate_val=:.4f})"
                         )
                     model.train()
 
@@ -264,10 +267,10 @@ def _run_evaluation(
     with torch.no_grad():
         task = progress.add_task(description, total=len(dataloader))
         for data in dataloader:
-            x, y_log, offsets, segment_ids, aircraft_type_idx, durations = (
+            x, y_log, cu_seqlens, segment_ids, aircraft_type_idx, durations = (
                 data.x.to(device),
                 data.y.to(device),
-                data.offsets.to(device),
+                data.cu_seqlens.to(device),
                 data.segment_ids.cpu(),
                 data.aircraft_type_idx.to(device),
                 data.durations.cpu(),
@@ -275,7 +278,7 @@ def _run_evaluation(
             with torch.autocast(
                 device_type=device, dtype=torch.bfloat16, enabled=(device == "cuda")
             ):
-                y_pred_log = model(x, offsets, aircraft_type_idx)
+                y_pred_log = model(x, cu_seqlens, aircraft_type_idx)
 
             y_pred_orig = torch.exp(y_pred_log) - 1.0
             y_true_orig = torch.exp(y_log) - 1.0
@@ -325,6 +328,9 @@ def evaluate(
     from rich.progress import Progress
     from torch.utils.data import DataLoader
 
+    from prc25.hacks import fla_autotuner_remove_nb
+
+    fla_autotuner_remove_nb()
     from prc25.dataloader import VarlenDataset, collate_fn
     from prc25.model import FuelBurnPredictor, FuelBurnPredictorConfig
 

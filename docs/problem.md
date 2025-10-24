@@ -51,7 +51,7 @@ $$
 y = \log\left(\frac{\text{fuel\_kg}}{t_{\text{end}} - t_{\text{start}}} + 1\right)
 $$
 
-which is pooled from the last token of the GDN.This simplifies the problem to a sequence-to-scalar regression task, avoiding direct integration of the instantaneous burn rate $\dot{m}_f(t)$.
+which is pooled from the last token of the GDN. This simplifies the problem to a sequence-to-scalar regression task, avoiding direct integration of the instantaneous burn rate $\dot{m}_f(t)$.
 
 | AC Type | Notes                        | Target                        | RMSE (kg/s) | RMSE (kg) | A20N RMSE (kg/s) | A20N RMSE (kg) |
 | ------- | ---------------------------- | ----------------------------- | ----------- | --------- | ---------------- | -------------- |
@@ -66,18 +66,18 @@ which is pooled from the last token of the GDN.This simplifies the problem to a 
 - ¹ these values refer to sequence length <= 256 and should not be compared directly with the other runs
 - loss spikes are crazy, possibly due to `fuel_burn` quantisation?
 
-## TODO
+<!-- training on the entire flight (with `is_in_segment` bool flags / adding `start` and `end` to the features worsened performnace) -->
 
-- model is biased towards short segments - loss shold be `error * duration ^ 2`
-- model has to compress everything, switch to mean pooling?
-- use `is_outlier` bool flags (check missingness first)
-- learning rate scheduling: warm up, hold at peak LR, then decay (cosine?)
-- train on the entire flight (add `is_in_segment` or add `start`/`end` directly to the features)
-- stack more layers with residual connections and rmsnorm between (though preliminary tests yield negligible improvements, maybe revisit when we train on the entire flight where the model has to compress information)
-- `fuel_burn` is quantised (see [data](./data.md)): also predict absolute uncertainty, but is this really needed? (gaussian_nll_loss probably isn't relevant)
-- staged training: train on short sequences first -> longer sequences
-- improve input projection.
-- gradient clipping
+## `v0.0.2`
+
+- A bug that caused segments with `seq_len = 2` to be excluded is fixed. this means the training set has much more (+30%) datapoints and so performance should NOT be compared with `v0.0.1` 
+- the `NB` triton autotune parameter was removed for dramatic speedup
+
+| Notes    | RMSE(kg/s)      | RMSE(kg)       |
+| -------- | --------------- | -------------- |
+| baseline | 0.3915 ± 0.0146 | 212.76 ± 16.52 |
+
+## `v0.0.3`
 
 data augmentation
 
@@ -85,3 +85,16 @@ data augmentation
 - kinematic features ($p, q, r$, $\dot{x}, \dot{y}, \dot{z}$) and specific energy
 - google-arco era5: temperature, pressure and uv at fligh level; isa deviation, GS -> TAS conversion, dynamic pressure
 - <https://github.com/DGAC/Acropole> - maybe use their final layer outputs?
+
+
+## TODO
+
+- model has to compress everything, switch to mean pooling? increased convergence speed but had no effect on validation rmse.
+- bidirectional?
+- use `is_outlier` bool flags (check missingness first)
+- learning rate scheduling: warm up, hold at peak LR, then decay (cosine?)
+- stack more layers with residual connections and rmsnorm between (though preliminary tests yield negligible improvements, maybe revisit when we train on the entire flight where the model has to compress information)
+- `fuel_burn` is quantised (see [data](./data.md)): also predict absolute uncertainty, but is this really needed? (gaussian_nll_loss probably isn't relevant)
+- staged training: train on short sequences first -> longer sequences
+- improve input projection.
+- gradient clipping
