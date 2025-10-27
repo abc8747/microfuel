@@ -10,7 +10,7 @@ import numpy as np
 import polars as pl
 from rich.progress import track
 
-from .. import PATH_PREPROCESSED, Partition, Split
+from .. import PATH_PREPROCESSED, Partition, Split, fpm2mps, ft2m, knot2mps
 from . import raw
 
 if TYPE_CHECKING:
@@ -34,13 +34,22 @@ def _np_interpolate(y: np.ndarray, x: np.ndarray) -> np.ndarray:
     return np.interp(x, x[valid_mask], y[valid_mask])
 
 
-def make_trajectories(partition: Partition, train_split: float = 0.8, seed: int = 13):
+def make_trajectories(
+    partition: Partition,
+    train_split: float = 0.8,
+    seed: int = 13,
+    *,
+    path_base: Path = PATH_PREPROCESSED,
+    altitude_max=ft2m(50000),
+    speed_max=knot2mps(800),
+    vertical_speed_max=fpm2mps(8000),
+):
     """Creates train/validation split of preprocessed trajectories.
 
     Everything related to segments (e.g. whether a particular state vector is within [start, end])
     should be handled elsewhere. This function processes the *entire* trajectory.
     """
-    PATH_PREPROCESSED.mkdir(exist_ok=True, parents=True)
+    path_base.mkdir(exist_ok=True, parents=True)
 
     flight_list_lf = raw.scan_flight_list(partition)
     fuel_lf = raw.scan_fuel(partition)
@@ -71,32 +80,36 @@ def make_trajectories(partition: Partition, train_split: float = 0.8, seed: int 
     train_trajectories: list[pl.LazyFrame] = []
     validation_trajectories: list[pl.LazyFrame] = []
 
-    all_flight_ids = flight_list_lf.select("flight_id").unique().collect()["flight_id"].to_list()
+    all_flight_ids = (
+        flight_list_lf.select("flight_id")
+        .sort("flight_id")
+        .unique()
+        .collect()["flight_id"]
+        .to_list()
+    )
     for flight_id in track(all_flight_ids, description="processing flights"):
         traj_lf = raw.scan_trajectory(flight_id, partition)
-        assert traj_lf is not None
-
         full_traj_df = traj_lf.sort("timestamp").collect()
         assert full_traj_df.height > 2
 
         takeoff_ts = flight_id_to_takeoff[flight_id]
 
         timestamp_s = full_traj_df["timestamp"].dt.epoch(time_unit="ms").to_numpy() / 1000.0
-        alt_raw = full_traj_df["altitude"].to_numpy()
-        gs_raw = full_traj_df["groundspeed"].to_numpy()
-        vs_raw = full_traj_df["vertical_rate"].to_numpy()
+        vs_raw = fpm2mps(full_traj_df["vertical_rate"].to_numpy())
+        alt_raw = ft2m(full_traj_df["altitude"].to_numpy())
+        gs_raw = knot2mps(full_traj_df["groundspeed"].to_numpy())
 
-        alt_outlier_mask = (alt_raw > 50000) | np.isnan(alt_raw)
-        gs_outlier_mask = (gs_raw > 800) | np.isnan(gs_raw)
-        vs_outlier_mask = (np.abs(vs_raw) > 8000) | np.isnan(vs_raw)
+        vs_outlier_mask = (np.abs(vs_raw) > vertical_speed_max) | np.isnan(vs_raw)
+        alt_outlier_mask = (alt_raw > altitude_max) | np.isnan(alt_raw)
+        gs_outlier_mask = (gs_raw > speed_max) | np.isnan(gs_raw)
 
+        vs_with_nan = np.where(vs_outlier_mask, np.nan, vs_raw)
         alt_with_nan = np.where(alt_outlier_mask, np.nan, alt_raw)
         gs_with_nan = np.where(gs_outlier_mask, np.nan, gs_raw)
-        vs_with_nan = np.where(vs_outlier_mask, np.nan, vs_raw)
 
+        vs_interp = _np_interpolate(vs_with_nan, timestamp_s)
         alt_interp = _np_interpolate(alt_with_nan, timestamp_s)
         gs_interp = _np_interpolate(gs_with_nan, timestamp_s)
-        vs_interp = _np_interpolate(vs_with_nan, timestamp_s)
 
         processed_traj_df = pl.DataFrame(
             {
@@ -104,12 +117,12 @@ def make_trajectories(partition: Partition, train_split: float = 0.8, seed: int 
                 "time_since_takeoff": (full_traj_df["timestamp"] - takeoff_ts).dt.total_seconds(
                     fractional=True
                 ),
+                "vertical_rate": vs_interp,
+                "vertical_rate_is_outlier": vs_outlier_mask,
                 "altitude": alt_interp,
                 "altitude_is_outlier": alt_outlier_mask,
                 "groundspeed": gs_interp,
                 "groundspeed_is_outlier": gs_outlier_mask,
-                "vertical_rate": vs_interp,
-                "vertical_rate_is_outlier": vs_outlier_mask,
             }
         ).with_columns(pl.lit(flight_id).alias("flight_id"))
 
@@ -122,7 +135,7 @@ def make_trajectories(partition: Partition, train_split: float = 0.8, seed: int 
         ("train", train_trajectories),
         ("validation", validation_trajectories),
     ]:
-        output_path = PATH_PREPROCESSED / f"trajectories_{partition}_{split}.parquet"
+        output_path = path_base / f"trajectories_{partition}_{split}.parquet"
         stop_event = multiprocessing.Event()
         monitor_process = multiprocessing.Process(
             target=_monitor_file_size, args=(output_path, stop_event)
@@ -168,10 +181,8 @@ class Stat(TypedDict):
 Stats: TypeAlias = dict[TrajectoryFeature, Stat]
 
 
-def make_standardisation_stats(
-    partition: Partition,
-):
-    train_traj_lf = pl.scan_parquet(PATH_PREPROCESSED / f"trajectories_{partition}_train.parquet")
+def make_standardisation_stats(partition: Partition, *, path_base: Path = PATH_PREPROCESSED):
+    train_traj_lf = pl.scan_parquet(path_base / f"trajectories_{partition}_train.parquet")
     train_flight_ids = train_traj_lf.select("flight_id").unique().collect()["flight_id"].to_list()
 
     trajectory_iterator = TrajectoryIterator(
@@ -199,7 +210,7 @@ def make_standardisation_stats(
             "std": row[f"{feature}_std"],
         }
 
-    output_path = PATH_PREPROCESSED / f"stats_{partition}.json"
+    output_path = path_base / f"stats_{partition}.json"
     with open(output_path, "w") as f:
         json.dump(standardisation_stats, f, indent=2)
     logger.info(f"wrote stats to {output_path}")
@@ -211,9 +222,9 @@ def make_standardisation_stats(
 
 
 def load_standardisation_stats(
-    partition: Partition,
+    partition: Partition, *, path_base: Path = PATH_PREPROCESSED
 ) -> Stats:
-    with open(PATH_PREPROCESSED / f"stats_{partition}.json") as f:
+    with open(path_base / f"stats_{partition}.json") as f:
         return json.load(f)
 
 
@@ -245,6 +256,7 @@ class TrajectoryIterator:
         shuffle_seed: int | None = None,
         stats: Stats | None = None,
         start_to_end_only: bool = False,
+        path_base: Path = PATH_PREPROCESSED,
     ):
         if segments_df is None:
             assert flight_ids is not None, "either `flight_ids` or `segments_df` must be provided"
@@ -259,7 +271,7 @@ class TrajectoryIterator:
             )
 
         self.segment_infos: list[TrajectoryInfo] = segments_df.to_dicts()  # type: ignore
-        traj_lf = pl.scan_parquet(PATH_PREPROCESSED / f"trajectories_{partition}_{split}.parquet")
+        traj_lf = pl.scan_parquet(path_base / f"trajectories_{partition}_{split}.parquet")
 
         if stats is not None:
             standardisation_exprs = [

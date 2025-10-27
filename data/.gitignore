@@ -3,5 +3,7 @@ config.toml
 raw/*
 # before 2025-10-11 15:30:22 CEST
 raw_old/*
+preprocessed_v0.0.2
+preprocessed/*.parquet
 
 tmp_*

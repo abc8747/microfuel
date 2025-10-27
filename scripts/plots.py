@@ -200,9 +200,6 @@ def speed_alt_fuel_burn(max_points_per_actype: float | None = 1000) -> None:
             description=ac_type,
         ):
             traj_lf = raw.scan_trajectory(row["flight_id"], "phase1")
-            if traj_lf is None:
-                continue
-
             traj_df = (
                 traj_lf.filter(
                     (pl.col("timestamp") < row["end"])
@@ -522,9 +519,9 @@ def preprocessed_trajectories(
         p3 = ax3.scatter(time, traj_df["vertical_rate"], s=1, color="C2", label="Vertical Rate")
 
         ax1.set_xlabel("Time Since Takeoff (s)")
-        ax1.set_ylabel("Altitude (ft)", color="C0")
-        ax2.set_ylabel("Groundspeed (kts)", color="C1")
-        ax3.set_ylabel("Vertical Rate (fpm)", color="C2")
+        ax1.set_ylabel("Altitude (m)", color="C0")
+        ax2.set_ylabel("Groundspeed (m/s)", color="C1")
+        ax3.set_ylabel("Vertical Rate (m/s)", color="C2")
 
         ax1.tick_params(axis="y", labelcolor="C0")
         ax2.tick_params(axis="y", labelcolor="C1")

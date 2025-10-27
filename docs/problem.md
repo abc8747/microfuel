@@ -70,7 +70,7 @@ which is pooled from the last token of the GDN. This simplifies the problem to a
 
 ## `v0.0.2`
 
-- A bug that caused segments with `seq_len = 2` to be excluded is fixed. this means the training set has much more (+30%) datapoints and so performance should NOT be compared with `v0.0.1` 
+- A bug that caused segments with `seq_len = 2` to be excluded is fixed. this means the training set has much more (+30%) datapoints and so performance should NOT be compared with `v0.0.1`
 - the `NB` triton autotune parameter was removed for dramatic speedup
 
 | Notes    | RMSE(kg/s)      | RMSE(kg)       |
@@ -79,13 +79,10 @@ which is pooled from the last token of the GDN. This simplifies the problem to a
 
 ## `v0.0.3`
 
-data augmentation
-
 - implement kalman filter
 - kinematic features ($p, q, r$, $\dot{x}, \dot{y}, \dot{z}$) and specific energy
 - google-arco era5: temperature, pressure and uv at fligh level; isa deviation, GS -> TAS conversion, dynamic pressure
 - <https://github.com/DGAC/Acropole> - maybe use their final layer outputs?
-
 
 ## TODO
 
