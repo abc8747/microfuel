@@ -25,13 +25,7 @@ VarlenBatch = namedtuple(
 
 
 class VarlenDataset(Dataset):
-    def __init__(
-        self,
-        partition: Partition,
-        split: Split,
-        min_seq_len: int = 2,
-        max_seq_len: int = 65536,
-    ):
+    def __init__(self, partition: Partition, split: Split):
         traj_lf = pl.scan_parquet(PATH_PREPROCESSED / f"trajectories_{partition}_{split}.parquet")
         flight_ids = traj_lf.select("flight_id").unique().collect()["flight_id"].to_list()
         self.stats = load_standardisation_stats(partition)
@@ -69,12 +63,16 @@ class VarlenDataset(Dataset):
             description=f"loading {split} data",
             total=len(trajectory_iterator),
         ):
-            segment_features_df = trajectory.features_df
-            if not (min_seq_len <= len(segment_features_df) <= max_seq_len):
+            # NOTE: some segments can have no data points...
+            if (height := trajectory.features_df.height) < 2:
+                logger.warning(
+                    f"skipping trajectory {trajectory.info['idx']} "
+                    f"({trajectory.info['start']}-{trajectory.info['end']}) with {height=}."
+                )
                 continue
 
             features_np = (
-                segment_features_df.select(preprocessed.TRAJECTORY_FEATURES)
+                trajectory.features_df.select(preprocessed.TRAJECTORY_FEATURES)
                 .to_numpy(order="c")
                 .astype(np.float32)
             )

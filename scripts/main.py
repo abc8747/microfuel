@@ -57,6 +57,7 @@ class TrainConfig:
     batch_size: int
     epochs: int
     lr: float
+    seed: int
     model_config: FuelBurnPredictorConfig
     project_name: str
     exp_name: str
@@ -80,11 +81,13 @@ def train(
     hidden_size: int = 32,
     num_heads: int = 2,
     aircraft_embedding_dim: int = 8,
+    *,
     project_name: str = "prc25-multiac",
-    exp_name: str = "gdn-all_ac-v0.0.2",
+    exp_name: str = "gdn-all_ac-v0.0.3+timetillarrival",
     evaluate_best: Annotated[
         bool, typer.Option(help="Evaluate the best model on the validation set after training.")
     ] = True,
+    seed: int = 13,
 ):
     import torch
     from rich.progress import (
@@ -100,6 +103,7 @@ def train(
     from prc25.hacks import fla_autotuner_remove_nb
 
     fla_autotuner_remove_nb()
+    torch.manual_seed(seed)
     import wandb
     from prc25.dataloader import VarlenDataset, collate_fn
     from prc25.datasets import preprocessed
@@ -126,6 +130,7 @@ def train(
         batch_size=batch_size,
         epochs=epochs,
         lr=lr,
+        seed=seed,
         model_config=model_cfg,
         project_name=project_name,
         exp_name=exp_name,

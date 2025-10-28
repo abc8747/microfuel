@@ -646,16 +646,29 @@ def _plot_varlen_batch(ax: Axes, data: VarlenBatch):
         )
 
 
-def _plot_scatter(ax: Axes, y_true: np.ndarray, y_pred: np.ndarray, title: str, unit: str):
+def _plot_scatter(
+    ax: Axes,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    seq_len: np.ndarray,
+    *,
+    title: str,
+    unit: str,
+    norm,
+):
     import numpy as np
 
     rmse = np.sqrt(np.mean((y_true - y_pred) ** 2))
-    stderr_rmse = np.std((y_true - y_pred) ** 2) / np.sqrt(len(y_true)) / (2 * rmse)
+    stderr_rmse = (
+        np.std((y_true - y_pred) ** 2) / np.sqrt(len(y_true)) / (2 * rmse) if rmse > 0 else 0
+    )
     ss_res = np.sum((y_true - y_pred) ** 2)
     ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
-    r2 = 1 - (ss_res / ss_tot)
+    r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
 
-    ax.scatter(y_true, y_pred, alpha=0.3, s=5, linewidth=0)
+    scatter = ax.scatter(
+        y_true, y_pred, alpha=0.3, s=2, linewidth=0, c=seq_len, norm=norm, cmap="viridis"
+    )
     min_val = min(y_true.min(), y_pred.min())
     max_val = max(y_true.max(), y_pred.max())
     ax.plot([min_val, max_val], [min_val, max_val], color="black", lw=0.5)
@@ -665,17 +678,32 @@ def _plot_scatter(ax: Axes, y_true: np.ndarray, y_pred: np.ndarray, title: str, 
     ax.grid(True, alpha=0.3)
     ax.set_xscale("log")
     ax.set_yscale("log")
+    return scatter
 
 
-def _plot_mae_vs_duration(ax: Axes, duration_s: np.ndarray, mae: np.ndarray, unit: str):
-    ax.scatter(duration_s, mae, s=5, linewidth=0, alpha=0.5)
+def _plot_mae_vs_duration(
+    ax: Axes, duration_s: np.ndarray, mae: np.ndarray, seq_len: np.ndarray, *, unit: str, norm
+):
+    scatter = ax.scatter(
+        duration_s,
+        mae,
+        s=2,
+        linewidth=0,
+        alpha=0.5,
+        c=seq_len,
+        norm=norm,
+        cmap="viridis",
+    )
 
-    log_duration = np.log10(duration_s)
-    log_mae = np.log10(mae)
+    valid_indices = (duration_s > 0) & (mae > 0)
+
+    log_duration = np.log10(duration_s[valid_indices])
+    log_mae = np.log10(mae[valid_indices])
+
     coeffs = np.polyfit(log_duration, log_mae, 1)
     slope, intercept = coeffs
 
-    duration_sorted = np.sort(duration_s)
+    duration_sorted = np.sort(duration_s[valid_indices])
     trendline = 10 ** (slope * np.log10(duration_sorted) + intercept)
 
     equation = f"$y = {10**intercept:.4f} x^{{{slope:.4f}}}$"
@@ -687,9 +715,10 @@ def _plot_mae_vs_duration(ax: Axes, duration_s: np.ndarray, mae: np.ndarray, uni
     ax.grid(True, alpha=0.3)
     ax.set_xscale("log")
     ax.set_yscale("log")
+    return scatter
 
 
-def _plot_dist_cdf(ax: Axes, y_true: np.ndarray, y_pred: np.ndarray, unit: str):
+def _plot_dist_cdf(ax: Axes, y_true: np.ndarray, y_pred: np.ndarray, *, unit: str):
     import numpy as np
 
     sorted_true = np.sort(y_true)
@@ -706,7 +735,7 @@ def _plot_dist_cdf(ax: Axes, y_true: np.ndarray, y_pred: np.ndarray, unit: str):
     ax.set_xscale("log")
 
 
-def _plot_rmse_cdf_by_actype(ax: Axes, df: pl.DataFrame, error_col: str, unit: str):
+def _plot_rmse_cdf_by_actype(ax: Axes, df: pl.DataFrame, error_col: str, *, unit: str):
     import numpy as np
     import polars as pl
 
@@ -747,6 +776,8 @@ def predictions(
     partition: Partition = "phase1",
     split: Split = "validation",
 ):
+    import matplotlib.colors as mcolors
+    import matplotlib.gridspec as gridspec
     import matplotlib.pyplot as plt
     import polars as pl
 
@@ -794,27 +825,57 @@ def predictions(
     duration_s = plot_df["duration_s"].to_numpy()
     mae_rate = plot_df["mae_rate"].to_numpy()
     mae_kg = plot_df["mae_kg"].to_numpy()
+    seq_len = plot_df["seq_len"].to_numpy()
 
-    fig, axes = plt.subplots(4, 2, figsize=(16, 24))
+    fig = plt.figure(figsize=(20, 32))
+    gs = gridspec.GridSpec(5, 2, height_ratios=[1, 1, 1, 1, 0.05], hspace=0.5)
 
-    _plot_scatter(axes[0, 0], y_true_rate, y_pred_rate, "Avg. Fuel Burn Rate", "kg/s")
-    _plot_scatter(axes[0, 1], y_true_kg, y_pred_kg, "Total Fuel Burn", "kg")
+    ax00 = fig.add_subplot(gs[0, 0])
+    ax01 = fig.add_subplot(gs[0, 1])
+    ax10 = fig.add_subplot(gs[1, 0])
+    ax11 = fig.add_subplot(gs[1, 1])
+    ax20 = fig.add_subplot(gs[2, 0])
+    ax21 = fig.add_subplot(gs[2, 1])
+    ax30 = fig.add_subplot(gs[3, 0])
+    ax31 = fig.add_subplot(gs[3, 1])
+    cbar_ax = fig.add_subplot(gs[4, :])
 
-    _plot_mae_vs_duration(axes[1, 0], duration_s, mae_rate, "kg/s")
-    _plot_mae_vs_duration(axes[1, 1], duration_s, mae_kg, "kg")
+    norm = mcolors.LogNorm(vmin=max(1, seq_len.min()), vmax=seq_len.max())
 
-    _plot_dist_cdf(axes[2, 0], y_true_rate, y_pred_rate, "kg/s")
-    _plot_dist_cdf(axes[2, 1], y_true_kg, y_pred_kg, "kg")
+    mappable = _plot_scatter(
+        ax00, y_true_rate, y_pred_rate, seq_len, title="Avg. Fuel Burn Rate", unit="kg/s", norm=norm
+    )
+    ax00.set_xlim(1e-2, 1e1)
+    ax00.set_ylim(1e-2, 1e1)
+    _plot_scatter(
+        ax01, y_true_kg, y_pred_kg, seq_len, title="Total Fuel Burn", unit="kg", norm=norm
+    )
+    ax01.set_xlim(1e0, 1e4)
+    ax01.set_ylim(1e0, 1e4)
 
-    _plot_rmse_cdf_by_actype(axes[3, 0], plot_df, "mae_rate", "kg/s")
-    _plot_rmse_cdf_by_actype(axes[3, 1], plot_df, "mae_kg", "kg")
+    _plot_mae_vs_duration(ax10, duration_s, mae_rate, seq_len, unit="kg/s", norm=norm)
+    ax10.set_xlim(1e1, 1e4)
+    ax10.set_ylim(1e-4, 1e1)
+    _plot_mae_vs_duration(ax11, duration_s, mae_kg, seq_len, unit="kg", norm=norm)
+    ax11.set_xlim(1e1, 1e4)
+    ax11.set_ylim(1e-2, 1e4)
 
-    fig.tight_layout(h_pad=4.0)
+    _plot_dist_cdf(ax20, y_true_rate, y_pred_rate, unit="kg/s")
+    ax20.set_xlim(1e-2, 1e1)
+    _plot_dist_cdf(ax21, y_true_kg, y_pred_kg, unit="kg")
+    ax21.set_xlim(1e0, 1e4)
+
+    _plot_rmse_cdf_by_actype(ax30, plot_df, "mae_rate", unit="kg/s")
+    ax30.set_xlim(1e-3, 1e1)
+    _plot_rmse_cdf_by_actype(ax31, plot_df, "mae_kg", unit="kg")
+    ax31.set_xlim(1e0, 1e4)
+
+    fig.colorbar(mappable, cax=cbar_ax, orientation="horizontal", label="Sequence Length")
 
     exp_name = predictions_path.stem.replace("_validation", "").replace("_test", "")
     plot_path = PATH_PLOTS_OUTPUT / "predictions" / f"{exp_name}.png"
     plot_path.parent.mkdir(exist_ok=True, parents=True)
-    fig.savefig(plot_path, bbox_inches="tight")
+    fig.savefig(plot_path, bbox_inches="tight", dpi=300)
     plt.close(fig)
     logger.info(f"wrote prediction plot to {plot_path}")
 

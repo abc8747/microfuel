@@ -68,23 +68,46 @@ which is pooled from the last token of the GDN. This simplifies the problem to a
 
 <!-- training on the entire flight (with `is_in_segment` bool flags / adding `start` and `end` to the features worsened performnace) -->
 
-## `v0.0.2`
+## `v0.0.2` onwards
 
-- A bug that caused segments with `seq_len = 2` to be excluded is fixed. this means the training set has much more (+30%) datapoints and so performance should NOT be compared with `v0.0.1`
-- the `NB` triton autotune parameter was removed for dramatic speedup
+- v0.0.2
+  - A bug that caused segments with `seq_len = 2` to be excluded is fixed. this means the training set has much more (+30%) datapoints and so performance should NOT be compared with `v0.0.1`
+  - the `NB` triton autotune parameter was removed for dramatic speedup
+- v0.0.3
+  - implemented constant-velocity kalman filter / rts smoother for {barometric altitude, inertial vertical rate, ground speed}:
+    (0.3861 ± 0.0142) kg/s | (212.58 ± 16.32) kg
+    faster convergence, rmse for short segments improved due to smoother estimates, but performance did not appreciably improve for longer segments (in fact, slightly worsened!)
 
-| Notes    | RMSE(kg/s)      | RMSE(kg)       |
-| -------- | --------------- | -------------- |
-| baseline | 0.3915 ± 0.0146 | 212.76 ± 16.52 |
-
-## `v0.0.3`
-
-- implement kalman filter
-- kinematic features ($p, q, r$, $\dot{x}, \dot{y}, \dot{z}$) and specific energy
-- google-arco era5: temperature, pressure and uv at fligh level; isa deviation, GS -> TAS conversion, dynamic pressure
-- <https://github.com/DGAC/Acropole> - maybe use their final layer outputs?
+| notes                                                   | rmse(kg/s)      | rmse(kg)       | notes                                      |
+| ------------------------------------------------------- | --------------- | -------------- | ------------------------------------------ |
+| v0.0.2                                                  | 0.3915 ± 0.0146 | 212.76 ± 16.52 |                                            |
+| v0.0.3                                                  | 0.3859 ± 0.0136 | 217.29 ± 15.90 |                                            |
+| v0.0.3 + $t_\text{end} - t_i$                           | 0.3779 ± 0.0141 | 212.45 ± 16.93 |                                            |
+| v0.0.3 + $t_\text{end} - t_i$ + $\dot{VS}$ + $\dot{GS}$ | 0.3794 ± 0.0136 | 212.19 ± 16.25 | slower convergence, negligible improvement |
 
 ## TODO
+
+### data
+
+- split gs, track -> vew, vns then separately filter that. do the same for lat/lng. $\phi = \arctan(\frac{V\dot{\phi}}{g})$
+- google-arco era5: temperature, pressure and uv at flight level; isa deviation, $V_{g} \rightarrow V$, $\rho = \frac{p}{\rho R T}$.
+- $\theta = \arcsin(\frac{\text{VS}}{V})$
+- assuming point mass, quasisteady flight, coordinated turn / no sideslip
+  - $\frac{C_L S}{m} = \frac{g\cos\gamma}{\frac{1}{2}\rho V^2 \cos\phi}$
+  - $\frac{T - D}{m} = \underbrace{V \frac{dV}{dt} + g \frac{dh}{dt}}_{\text{Specific Energy Rate}} + \text{wind effect}$
+- handle outliers robustly:
+  - `prc770867379`, `prc770868424`: weird drops in altitude
+    - in cases where this happens, ground speed is also similarity affected: data corrupted?
+  - `prc770844923`: weird peaks in vertical_rate
+  - between large time gaps where altitude is at cruising level and vertical rate is missing, heuristic: we should make it zero instead of interpolating
+- <https://github.com/DGAC/Acropole> - maybe use their final layer outputs?
+
+misc
+
+- add fraction of time elapsed in segment, not $\Delta t$ since it harms performance
+- parameterise the sequence length being predicted
+
+### model
 
 - model has to compress everything, switch to mean pooling? increased convergence speed but had no effect on validation rmse.
 - bidirectional?
@@ -95,3 +118,4 @@ which is pooled from the last token of the GDN. This simplifies the problem to a
 - staged training: train on short sequences first -> longer sequences
 - improve input projection.
 - gradient clipping
+

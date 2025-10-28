@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import logging
 import multiprocessing
+from collections import namedtuple
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, TypedDict, get_args
 
 import numpy as np
 import polars as pl
+from numba import njit
 from rich.progress import track
 
 from .. import PATH_PREPROCESSED, Partition, Split, fpm2mps, ft2m, knot2mps
@@ -16,15 +18,196 @@ from . import raw
 if TYPE_CHECKING:
     import datetime
     from multiprocessing.synchronize import Event
-    from typing import Collection, Iterator, TypeAlias
+    from typing import Annotated, Collection, Iterator, TypeAlias
+
+    import isqx
+    import isqx.aerospace
+
 
 logger = logging.getLogger(__name__)
 AcType: TypeAlias = str
 FlightId: TypeAlias = str
-TrajectoryFeature = Literal["time_since_takeoff", "altitude", "groundspeed", "vertical_rate"]
+TrajectoryFeature = Literal[
+    "time_since_takeoff",
+    "time_till_arrival",
+    "altitude",
+    "groundspeed",
+    "vertical_rate",
+    # "vertical_accel",
+    # "groundspeed_rate",
+]
 TRAJECTORY_FEATURES = get_args(TrajectoryFeature)
-# SegmentFeature = Literal["time_since_start", "time_since_end"]
-# SEGMENT_FEATURES = get_args(SegmentFeature)
+
+
+@njit(cache=True)
+def _kalman_filter(
+    measurements: np.ndarray,
+    dts: np.ndarray,
+    initial_state_mean: np.ndarray,
+    initial_state_covariance: np.ndarray,
+    transition_matrix_fn_val: np.ndarray,
+    observation_matrix: np.ndarray,
+    process_noise_covariance: np.ndarray,
+    observation_noise_covariance: np.ndarray,
+):
+    n_timesteps = measurements.shape[0]
+    n_dim_state = initial_state_mean.shape[0]
+
+    filtered_state_means = np.zeros((n_timesteps, n_dim_state))
+    filtered_state_covariances = np.zeros((n_timesteps, n_dim_state, n_dim_state))
+
+    x = initial_state_mean.copy()
+    p = initial_state_covariance.copy()
+
+    filtered_state_means[0] = x
+    filtered_state_covariances[0] = p
+    identity_matrix = np.eye(n_dim_state)
+
+    for t in range(1, n_timesteps):
+        f = transition_matrix_fn_val.copy()
+        f[0, 1] = dts[t - 1]
+
+        x_pred = f @ x
+        p_pred = f @ p @ f.T + process_noise_covariance
+
+        z = measurements[t]
+        is_nan = np.isnan(z)
+
+        if is_nan:
+            x = x_pred
+            p = p_pred
+        else:
+            h = observation_matrix
+            y = z - h @ x_pred
+            s = h @ p_pred @ h.T + observation_noise_covariance
+            s_inv = np.linalg.inv(s)
+            k = p_pred @ h.T @ s_inv
+            x = x_pred + k @ y
+            p = (identity_matrix - k @ h) @ p_pred
+
+        filtered_state_means[t] = x
+        filtered_state_covariances[t] = p
+
+    return filtered_state_means, filtered_state_covariances
+
+
+@njit(cache=True)
+def _rts_smoother_numba(
+    filtered_state_means: np.ndarray,
+    filtered_state_covariances: np.ndarray,
+    dts: np.ndarray,
+    transition_matrix_fn_val: np.ndarray,
+    process_noise_covariance: np.ndarray,
+):
+    n_timesteps, n_dim_state = filtered_state_means.shape
+    smoothed_state_means = filtered_state_means.copy()
+    smoothed_state_covariances = filtered_state_covariances.copy()
+
+    for k in range(n_timesteps - 2, -1, -1):
+        x_k_k = filtered_state_means[k]
+        p_k_k = filtered_state_covariances[k]
+        x_k1_n = smoothed_state_means[k + 1]
+        p_k1_n = smoothed_state_covariances[k + 1]
+
+        f = transition_matrix_fn_val.copy()
+        f[0, 1] = dts[k]
+        q = process_noise_covariance
+
+        x_k1_k = f @ x_k_k
+        p_k1_k = f @ p_k_k @ f.T + q
+        p_k1_k_inv = np.linalg.inv(p_k1_k)
+
+        c_k = p_k_k @ f.T @ p_k1_k_inv
+
+        smoothed_state_means[k] = x_k_k + c_k @ (x_k1_n - x_k1_k)
+        smoothed_state_covariances[k] = p_k_k + c_k @ (p_k1_n - p_k1_k) @ c_k.T
+
+    return smoothed_state_means, smoothed_state_covariances
+
+
+SmoothResult = namedtuple(
+    "SmoothResult",
+    [
+        "smoothed_values",
+        "smoothed_derivatives",
+        "smoothed_value_variances",
+        "smoothed_derivative_variances",
+    ],
+)
+
+
+def smooth_time_series(
+    values,
+    dts_s,
+    process_noise_variances: tuple[float, float],
+    observation_noise_variance: float,
+    gap_threshold: float = 30.0,
+) -> SmoothResult:
+    """Applies a Kalman filter and RTS smoother to a 1D time series, handling large gaps.
+
+    Assumes a constant-velocity model.
+    :param process_noise_variances: (pos, vel) variances for the model's state transition noise (Q).
+    :param observation_noise_variance: variance for the measurement noise (R).
+    :param gap_threshold: time gap (in seconds) above which to split the time series into chunks.
+    """
+    gap_indices = np.where(dts_s > gap_threshold)[0]
+    chunk_boundaries = np.concatenate(([0], gap_indices + 1, [len(values)]))
+
+    all_smoothed_values = np.full_like(values, np.nan)
+    all_smoothed_derivatives = np.full_like(values, np.nan)
+    all_smoothed_value_variances = np.full_like(values, np.nan)
+    all_smoothed_derivative_variances = np.full_like(values, np.nan)
+
+    transition_matrix_template = np.array([[1.0, 0.0], [0.0, 1.0]])
+    observation_matrix = np.array([[1.0, 0.0]])
+    process_noise_covariance = np.diag(np.array(process_noise_variances, dtype=np.float64))
+    observation_noise_covariance = np.array([[observation_noise_variance]])
+
+    for i in range(len(chunk_boundaries) - 1):
+        start, end = chunk_boundaries[i], chunk_boundaries[i + 1]
+        chunk_values = values[start:end]
+        chunk_dts = dts_s[start : end - 1]
+
+        if len(chunk_values) < 2:
+            continue
+
+        first_valid_idx = np.where(~np.isnan(chunk_values))[0]
+        if len(first_valid_idx) == 0:
+            continue
+        initial_value = chunk_values[first_valid_idx[0]]
+        initial_state_mean = np.array([initial_value, 0.0])
+        initial_state_covariance = np.eye(2) * 1e5
+
+        filtered_means, filtered_covs = _kalman_filter(
+            measurements=chunk_values,
+            dts=chunk_dts,
+            initial_state_mean=initial_state_mean,
+            initial_state_covariance=initial_state_covariance,
+            transition_matrix_fn_val=transition_matrix_template,
+            observation_matrix=observation_matrix,
+            process_noise_covariance=process_noise_covariance,
+            observation_noise_covariance=observation_noise_covariance,
+        )
+
+        smoothed_means, smoothed_covs = _rts_smoother_numba(
+            filtered_means,
+            filtered_covs,
+            chunk_dts,
+            transition_matrix_template,
+            process_noise_covariance,
+        )
+
+        all_smoothed_values[start:end] = smoothed_means[:, 0]
+        all_smoothed_derivatives[start:end] = smoothed_means[:, 1]
+        all_smoothed_value_variances[start:end] = smoothed_covs[:, 0, 0]
+        all_smoothed_derivative_variances[start:end] = smoothed_covs[:, 1, 1]
+
+    return SmoothResult(
+        all_smoothed_values,
+        all_smoothed_derivatives,
+        all_smoothed_value_variances,
+        all_smoothed_derivative_variances,
+    )
 
 
 def _np_interpolate(y: np.ndarray, x: np.ndarray) -> np.ndarray:
@@ -40,9 +223,12 @@ def make_trajectories(
     seed: int = 13,
     *,
     path_base: Path = PATH_PREPROCESSED,
-    altitude_max=ft2m(50000),
-    speed_max=knot2mps(800),
-    vertical_speed_max=fpm2mps(8000),
+    altitude_max: Annotated[float, isqx.aerospace.PRESSURE_ALTITUDE(isqx.M)] = ft2m(50000),
+    speed_max: Annotated[float, isqx.SPEED(isqx.M_PERS)] = knot2mps(800),
+    vertical_speed_max: Annotated[float, isqx.aerospace.VS(isqx.M_PERS)] = fpm2mps(8000),
+    vertical_accel_max: Annotated[float, isqx.M_PERS2] = 3.0,
+    groundspeed_rate_max: Annotated[float, isqx.aerospace.GS(isqx.M_PERS)] = 1.5,
+    plot_every_n_flights: int | None = None,
 ):
     """Creates train/validation split of preprocessed trajectories.
 
@@ -76,23 +262,29 @@ def make_trajectories(
         d["flight_id"]: d["takeoff"]
         for d in flight_list_lf.select("flight_id", "takeoff").collect().iter_rows(named=True)
     }
+    flight_id_to_landed = {
+        d["flight_id"]: d["landed"]
+        for d in flight_list_lf.select("flight_id", "landed").collect().iter_rows(named=True)
+    }
 
     train_trajectories: list[pl.LazyFrame] = []
     validation_trajectories: list[pl.LazyFrame] = []
 
     all_flight_ids = (
         flight_list_lf.select("flight_id")
-        .sort("flight_id")
         .unique()
+        .sort("flight_id")
         .collect()["flight_id"]
         .to_list()
     )
-    for flight_id in track(all_flight_ids, description="processing flights"):
+    for i, flight_id in enumerate(track(all_flight_ids, description="processing flights")):
         traj_lf = raw.scan_trajectory(flight_id, partition)
         full_traj_df = traj_lf.sort("timestamp").collect()
-        assert full_traj_df.height > 2
+        if full_traj_df.height <= 2:
+            continue
 
         takeoff_ts = flight_id_to_takeoff[flight_id]
+        landed_ts = flight_id_to_landed[flight_id]
 
         timestamp_s = full_traj_df["timestamp"].dt.epoch(time_unit="ms").to_numpy() / 1000.0
         vs_raw = fpm2mps(full_traj_df["vertical_rate"].to_numpy())
@@ -107,22 +299,201 @@ def make_trajectories(
         alt_with_nan = np.where(alt_outlier_mask, np.nan, alt_raw)
         gs_with_nan = np.where(gs_outlier_mask, np.nan, gs_raw)
 
-        vs_interp = _np_interpolate(vs_with_nan, timestamp_s)
-        alt_interp = _np_interpolate(alt_with_nan, timestamp_s)
-        gs_interp = _np_interpolate(gs_with_nan, timestamp_s)
+        dts_s = np.diff(timestamp_s)
+        alt_res = smooth_time_series(
+            values=alt_with_nan,
+            dts_s=dts_s,
+            process_noise_variances=(1.0**2, 0.3**2),
+            observation_noise_variance=4.0**2,
+        )
+        vs_res = smooth_time_series(
+            values=vs_with_nan,
+            dts_s=dts_s,
+            process_noise_variances=(0.3**2, 0.1**2),
+            observation_noise_variance=1.0**2,
+        )
+        gs_res = smooth_time_series(
+            values=gs_with_nan,
+            dts_s=dts_s,
+            process_noise_variances=(1.0**2, 0.5**2),
+            observation_noise_variance=6.0**2,
+        )
 
+        vertical_accel_raw = vs_res.smoothed_derivatives
+        groundspeed_rate_raw = gs_res.smoothed_derivatives
+
+        vertical_accel_with_nan = np.where(
+            (np.abs(vertical_accel_raw) > vertical_accel_max) | np.isnan(vertical_accel_raw),
+            np.nan,
+            vertical_accel_raw,
+        )
+        groundspeed_rate_with_nan = np.where(
+            (np.abs(groundspeed_rate_raw) > groundspeed_rate_max) | np.isnan(groundspeed_rate_raw),
+            np.nan,
+            groundspeed_rate_raw,
+        )
+
+        if i < 100 or (plot_every_n_flights is not None and i % plot_every_n_flights == 0):
+            import matplotlib.pyplot as plt
+            from matplotlib.gridspec import GridSpec
+
+            fig = plt.figure(figsize=(20, 12), constrained_layout=True)
+            gs = GridSpec(3, 2, figure=fig)
+
+            ax_alt = fig.add_subplot(gs[0, 0])
+            ax_vs = fig.add_subplot(gs[1, 0], sharex=ax_alt)
+            ax_vaccel = fig.add_subplot(gs[2, 0], sharex=ax_alt)
+
+            ax_gs = fig.add_subplot(gs[0, 1])
+            ax_gsrate = fig.add_subplot(gs[1, 1], sharex=ax_gs)
+
+            ax_alt.plot(timestamp_s, alt_raw, "k.", markersize=2, alpha=0.3, label="raw altitude")
+            ax_alt.plot(
+                timestamp_s, alt_res.smoothed_values, "r-", linewidth=0.5, label="smoothed altitude"
+            )
+            alt_std = np.sqrt(alt_res.smoothed_value_variances)
+            ax_alt.fill_between(
+                timestamp_s,
+                alt_res.smoothed_values - alt_std,
+                alt_res.smoothed_values + alt_std,
+                color="r",
+                alpha=0.2,
+                label=r"$\pm 1 \sigma$",
+            )
+            ax_alt.set_ylabel("altitude (m)")
+            ax_alt.set_ylim(0, altitude_max)
+            ax_alt.legend()
+            ax_alt.grid(True, alpha=0.3)
+
+            ax_vs.plot(
+                timestamp_s, vs_raw, "k.", markersize=2, alpha=0.3, label="raw vertical rate"
+            )
+            ax_vs.plot(
+                timestamp_s,
+                vs_res.smoothed_values,
+                "r-",
+                linewidth=0.5,
+                label="smoothed vertical rate",
+            )
+            ax_vs.plot(
+                timestamp_s,
+                alt_res.smoothed_derivatives,
+                "b--",
+                linewidth=0.5,
+                label="smoothed altitude derivative",
+            )
+            vs_std = np.sqrt(vs_res.smoothed_value_variances)
+            ax_vs.fill_between(
+                timestamp_s,
+                vs_res.smoothed_values - vs_std,
+                vs_res.smoothed_values + vs_std,
+                color="r",
+                alpha=0.2,
+                label=r"$\pm 1 \sigma$ (vs)",
+            )
+            ax_vs.set_ylabel("vertical rate (m/s)")
+            ax_vs.set_ylim(-vertical_speed_max, vertical_speed_max)
+            ax_vs.legend()
+            ax_vs.grid(True, alpha=0.3)
+
+            ax_vaccel.plot(
+                timestamp_s,
+                vertical_accel_raw,
+                "g-",
+                linewidth=0.5,
+                label="smoothed vertical acceleration",
+            )
+            vs_accel_std = np.sqrt(vs_res.smoothed_derivative_variances)
+            ax_vaccel.fill_between(
+                timestamp_s,
+                vertical_accel_raw - vs_accel_std,
+                vertical_accel_raw + vs_accel_std,
+                color="g",
+                alpha=0.2,
+                label=r"$\pm 1 \sigma$",
+            )
+            ax_vaccel.set_ylabel("vertical accel (m/s²)")
+            ax_vaccel.set_xlabel("time (s)")
+            ax_vaccel.set_ylim(-vertical_accel_max, vertical_accel_max)
+            ax_vaccel.legend()
+            ax_vaccel.grid(True, alpha=0.3)
+
+            ax_gs.plot(timestamp_s, gs_raw, "k.", markersize=2, alpha=0.3, label="raw groundspeed")
+            ax_gs.plot(
+                timestamp_s,
+                gs_res.smoothed_values,
+                "r-",
+                linewidth=0.5,
+                label="smoothed groundspeed",
+            )
+            gs_std = np.sqrt(gs_res.smoothed_value_variances)
+            ax_gs.fill_between(
+                timestamp_s,
+                gs_res.smoothed_values - gs_std,
+                gs_res.smoothed_values + gs_std,
+                color="r",
+                alpha=0.2,
+                label=r"$\pm 1 \sigma$",
+            )
+            ax_gs.set_ylabel("groundspeed (m/s)")
+            ax_gs.set_ylim(0, speed_max)
+            ax_gs.legend()
+            ax_gs.grid(True, alpha=0.3)
+
+            ax_gsrate.plot(
+                timestamp_s,
+                groundspeed_rate_raw,
+                "g-",
+                linewidth=0.5,
+                label="smoothed groundspeed rate",
+            )
+            gs_rate_std = np.sqrt(gs_res.smoothed_derivative_variances)
+            ax_gsrate.fill_between(
+                timestamp_s,
+                groundspeed_rate_raw - gs_rate_std,
+                groundspeed_rate_raw + gs_rate_std,
+                color="g",
+                alpha=0.2,
+                label=r"$\pm 1 \sigma$",
+            )
+            ax_gsrate.set_ylabel("groundspeed rate (m/s²)")
+            ax_gsrate.set_xlabel("time (s)")
+            ax_gsrate.set_ylim(-groundspeed_rate_max, groundspeed_rate_max)
+            ax_gsrate.legend()
+            ax_gsrate.grid(True, alpha=0.3)
+
+            plt.setp(ax_alt.get_xticklabels(), visible=False)
+            plt.setp(ax_vs.get_xticklabels(), visible=False)
+            plt.setp(ax_gs.get_xticklabels(), visible=False)
+            fig.suptitle(f"flight id: {flight_id}")
+
+            output_dir = path_base / "plots" / "rts_smoother"
+            output_dir.mkdir(exist_ok=True, parents=True)
+            output_path = output_dir / f"{partition}_{flight_id}.png"
+            fig.savefig(output_path)
+            plt.close(fig)
+
+        # its possible that the very start of the smoothed data isn't processed
+        # so we must interpolate.
         processed_traj_df = pl.DataFrame(
             {
                 "timestamp": full_traj_df["timestamp"],
                 "time_since_takeoff": (full_traj_df["timestamp"] - takeoff_ts).dt.total_seconds(
                     fractional=True
                 ),
-                "vertical_rate": vs_interp,
-                "vertical_rate_is_outlier": vs_outlier_mask,
-                "altitude": alt_interp,
-                "altitude_is_outlier": alt_outlier_mask,
-                "groundspeed": gs_interp,
-                "groundspeed_is_outlier": gs_outlier_mask,
+                "time_till_arrival": (landed_ts - full_traj_df["timestamp"]).dt.total_seconds(
+                    fractional=True
+                ),
+                "vertical_rate": _np_interpolate(vs_res.smoothed_values, timestamp_s),
+                "vertical_accel": _np_interpolate(vertical_accel_with_nan, timestamp_s),
+                "vertical_rate_is_outlier": (vs_outlier_mask | np.isnan(vs_res.smoothed_values)),
+                # "vertical_accel_is_outlier": vertical_accel_outlier_mask,
+                "altitude": _np_interpolate(alt_res.smoothed_values, timestamp_s),
+                "altitude_is_outlier": (alt_outlier_mask | np.isnan(alt_res.smoothed_values)),
+                "groundspeed": _np_interpolate(gs_res.smoothed_values, timestamp_s),
+                "groundspeed_rate": _np_interpolate(groundspeed_rate_with_nan, timestamp_s),
+                "groundspeed_is_outlier": (gs_outlier_mask | np.isnan(gs_res.smoothed_values)),
+                # "groundspeed_rate_is_outlier": groundspeed_rate_outlier_mask,
             }
         ).with_columns(pl.lit(flight_id).alias("flight_id"))
 
