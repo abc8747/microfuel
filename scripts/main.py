@@ -34,6 +34,27 @@ def download_raw():
 
 
 @app.command()
+def create_actype_enum(partition: Partition = "phase1"):
+    from prc25 import AIRCRAFT_TYPES
+    from prc25.datasets import raw
+
+    df = raw.scan_flight_list(partition).collect()
+    top_ac_types = (
+        df.group_by("aircraft_type").len().sort(by=("len", "aircraft_type"), descending=True)
+    )
+    total = top_ac_types["len"].sum()
+    if list(AIRCRAFT_TYPES) != (expected_ac_types := top_ac_types["aircraft_type"].to_list()):
+        logger.warning(
+            f"expected `AIRCRAFT_TYPES` enum to be {expected_ac_types}, but got {AIRCRAFT_TYPES}"
+        )
+    source = "Literal[\n"
+    for aircraft_type, count in top_ac_types.iter_rows():
+        source += f'    "{aircraft_type}",  # {count / total:.2%}\n'
+    source += "]"
+    print(source)
+
+
+@app.command()
 def create_dataset(
     partition: Partition,
 ):
@@ -83,7 +104,7 @@ def train(
     aircraft_embedding_dim: int = 8,
     *,
     project_name: str = "prc25-multiac",
-    exp_name: str = "gdn-all_ac-v0.0.3+timetillarrival",
+    exp_name: str = "gdn-all_ac-v0.0.4",
     evaluate_best: Annotated[
         bool, typer.Option(help="Evaluate the best model on the validation set after training.")
     ] = True,

@@ -78,12 +78,13 @@ which is pooled from the last token of the GDN. This simplifies the problem to a
     (0.3861 ± 0.0142) kg/s | (212.58 ± 16.32) kg
     faster convergence, rmse for short segments improved due to smoother estimates, but performance did not appreciably improve for longer segments (in fact, slightly worsened!)
 
-| notes                                                   | rmse(kg/s)      | rmse(kg)       | notes                                      |
-| ------------------------------------------------------- | --------------- | -------------- | ------------------------------------------ |
-| v0.0.2                                                  | 0.3915 ± 0.0146 | 212.76 ± 16.52 |                                            |
-| v0.0.3                                                  | 0.3859 ± 0.0136 | 217.29 ± 15.90 |                                            |
-| v0.0.3 + $t_\text{end} - t_i$                           | 0.3779 ± 0.0141 | 212.45 ± 16.93 |                                            |
-| v0.0.3 + $t_\text{end} - t_i$ + $\dot{VS}$ + $\dot{GS}$ | 0.3794 ± 0.0136 | 212.19 ± 16.25 | slower convergence, negligible improvement |
+| notes                                                   | rmse(kg/s)      | rmse(kg)       | notes                                           |
+| ------------------------------------------------------- | --------------- | -------------- | ----------------------------------------------- |
+| v0.0.2                                                  | 0.3915 ± 0.0146 | 212.76 ± 16.52 |                                                 |
+| v0.0.3                                                  | 0.3859 ± 0.0136 | 217.29 ± 15.90 |                                                 |
+| v0.0.3 + $t_\text{end} - t_i$                           | 0.3779 ± 0.0141 | 212.45 ± 16.93 |                                                 |
+| v0.0.3 + $t_\text{end} - t_i$ + $\dot{VS}$ + $\dot{GS}$ | 0.3794 ± 0.0136 | 212.19 ± 16.25 | slower convergence, negligible improvement      |
+| v0.0.4                                                  | 0.4182 ± 0.0138 | 218.87 ± 18.55 | includes $t_\text{end} - t_i$ and `seq_len` < 2 |
 
 ## TODO
 

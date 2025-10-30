@@ -9,8 +9,8 @@ import torch
 from rich.progress import track
 from torch.utils.data import Dataset
 
-from . import PATH_PREPROCESSED, Partition, Split
-from .datasets import preprocessed, raw
+from . import AIRCRAFT_TYPES, PATH_PREPROCESSED, Partition, Split
+from .datasets import preprocessed
 from .datasets.preprocessed import TrajectoryIterator, load_standardisation_stats
 
 logger = logging.getLogger(__name__)
@@ -30,24 +30,10 @@ class VarlenDataset(Dataset):
         flight_ids = traj_lf.select("flight_id").unique().collect()["flight_id"].to_list()
         self.stats = load_standardisation_stats(partition)
 
-        train_traj_lf = pl.scan_parquet(
-            PATH_PREPROCESSED / f"trajectories_{partition}_train.parquet"
-        )
-        train_flight_ids = (
-            train_traj_lf.select("flight_id").unique().collect()["flight_id"].to_list()
-        )
-
-        flight_list_lf = raw.scan_flight_list(partition)
-        ac_types = (
-            flight_list_lf.filter(pl.col("flight_id").is_in(train_flight_ids))
-            .select("aircraft_type")
-            .unique()
-            .sort("aircraft_type")
-            .collect()["aircraft_type"]
-            .to_list()
-        )
-        self.ac_type_vocab = {ac_type: i for i, ac_type in enumerate(ac_types)}
+        self.ac_type_vocab = {ac_type: i for i, ac_type in enumerate(AIRCRAFT_TYPES)}
         self.ac_type_vocab["UNK"] = len(self.ac_type_vocab)
+        # TODO: for some reason removing UNK worsens performance significantly
+        # but UNK is unused so maybe something with the initialisation.
 
         trajectory_iterator = TrajectoryIterator(
             partition=partition,
@@ -63,12 +49,12 @@ class VarlenDataset(Dataset):
             description=f"loading {split} data",
             total=len(trajectory_iterator),
         ):
-            # NOTE: some segments can have no data points...
             if (height := trajectory.features_df.height) < 2:
-                logger.warning(
-                    f"skipping trajectory {trajectory.info['idx']} "
-                    f"({trajectory.info['start']}-{trajectory.info['end']}) with {height=}."
-                )
+                logger.error(
+                    f"expected {trajectory.info['flight_id']}/{trajectory.info['idx']} to have "
+                    f"at least two datapoints, but got {height} points for "
+                    f"{trajectory.info['start']} - {trajectory.info['end']})."
+                )  # shouldn't happen: preprocessed.py already ensures each segment has [start, end]
                 continue
 
             features_np = (

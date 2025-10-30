@@ -14,7 +14,7 @@ from rich.logging import RichHandler
 from rich.progress import track
 
 import prc25.plot as p
-from prc25 import PATH_PLOTS_OUTPUT, PATH_PREPROCESSED, Partition, Split
+from prc25 import AIRCRAFT_TYPES, PATH_PLOTS_OUTPUT, PATH_PREPROCESSED, Partition, Split
 from prc25.datasets import raw
 
 if TYPE_CHECKING:
@@ -39,7 +39,12 @@ def flight_duration_cdf() -> None:
     )
     total = len(df)
 
-    top_ac_types = df.group_by("aircraft_type").len().sort("len", descending=True)
+    top_ac_types = (
+        df.group_by("aircraft_type")
+        .len()
+        .with_columns(pl.col("aircraft_type").cast(pl.Enum(AIRCRAFT_TYPES)))
+        .sort("aircraft_type")
+    )
     num_types = len(top_ac_types)
 
     for i, row in enumerate(top_ac_types.iter_rows(named=True)):
@@ -150,14 +155,7 @@ def speed_alt_fuel_burn(max_points_per_actype: float | None = 1000) -> None:
 
     flight_list_lf = raw.scan_flight_list("phase1")
 
-    top_ac_types = (
-        flight_list_lf.group_by("aircraft_type")
-        .len()
-        .sort("len", descending=True)
-        .head(16)
-        .collect()["aircraft_type"]
-        .to_list()
-    )
+    top_ac_types = list(AIRCRAFT_TYPES[:16])
 
     if max_points_per_actype is not None:
         sampled_dfs: list[pl.DataFrame] = []
@@ -471,89 +469,6 @@ def preprocessed_features_cdf(
     logger.info(f"wrote cdf plot to {output_path_cdf}")
 
 
-@app.command()
-def preprocessed_trajectories(
-    partition: Partition = "phase1",
-    num_flights: int = 100,
-) -> None:
-    output_dir = PATH_PLOTS_OUTPUT / "preprocessed_trajectories"
-    output_dir.mkdir(exist_ok=True, parents=True)
-
-    preprocessed_lf = pl.scan_parquet(PATH_PREPROCESSED / f"trajectories_{partition}.parquet")
-    flight_list_lf = raw.scan_flight_list(partition)
-    fuel_lf = raw.scan_fuel(partition)
-
-    flight_ids = (
-        preprocessed_lf.select("flight_id")
-        .unique()
-        .sort("flight_id")
-        .head(num_flights)
-        .collect()
-        .to_series()
-        .to_list()
-    )
-
-    segments_lf = (
-        flight_list_lf.select("flight_id", "takeoff")
-        .filter(pl.col("flight_id").is_in(flight_ids))
-        .join(fuel_lf, on="flight_id")
-        .with_columns(
-            start_s=(pl.col("start") - pl.col("takeoff")).dt.total_seconds(fractional=True),
-            end_s=(pl.col("end") - pl.col("takeoff")).dt.total_seconds(fractional=True),
-        )
-    )
-
-    for flight_id in track(flight_ids, description="plotting trajectories"):
-        traj_df = preprocessed_lf.filter(pl.col("flight_id") == flight_id).collect()
-        segments_df = segments_lf.filter(pl.col("flight_id") == flight_id).collect()
-
-        fig = p.default_fig(figsize=(20, 8))
-        ax1 = fig.add_subplot(111)
-        ax2 = ax1.twinx()
-        ax3 = ax1.twinx()
-        ax3.spines["right"].set_position(("axes", 1.04))
-
-        time = traj_df["time_since_takeoff"]
-        p1 = ax1.scatter(time, traj_df["altitude"], s=1, color="C0", label="Altitude")
-        p2 = ax2.scatter(time, traj_df["groundspeed"], s=1, color="C1", label="Groundspeed")
-        p3 = ax3.scatter(time, traj_df["vertical_rate"], s=1, color="C2", label="Vertical Rate")
-
-        ax1.set_xlabel("Time Since Takeoff (s)")
-        ax1.set_ylabel("Altitude (m)", color="C0")
-        ax2.set_ylabel("Groundspeed (m/s)", color="C1")
-        ax3.set_ylabel("Vertical Rate (m/s)", color="C2")
-
-        ax1.tick_params(axis="y", labelcolor="C0")
-        ax2.tick_params(axis="y", labelcolor="C1")
-        ax3.tick_params(axis="y", labelcolor="C2")
-
-        for i, row in enumerate(segments_df.iter_rows(named=True)):
-            start, end = row["start_s"], row["end_s"]
-            color = f"C{(i + 3) % 10}"
-            ax1.axvspan(start, end, alpha=0.2, color=color)
-
-            segment_traj = traj_df.filter(pl.col("time_since_takeoff").is_between(start, end))
-            duration_s = end - start
-            label_text = f"{row['idx']}: {segment_traj.height}/{duration_s:.0f}s"
-
-            ax1.text(
-                (start + end) / 2,
-                ax1.get_ylim()[1] * 0.15,
-                label_text,
-                ha="center",
-                va="top",
-                rotation=45,
-                color=color,
-            )
-
-        fig.suptitle(f"flight id: {flight_id}")
-        fig.legend(handles=[p1, p2, p3], loc="upper right")
-        output_path = output_dir / f"{flight_id}.png"
-        fig.savefig(output_path, bbox_inches="tight", dpi=150)
-        logger.info(f"wrote {output_path}")
-        plt.close(fig)
-
-
 #
 # train
 #
@@ -742,14 +657,15 @@ def _plot_rmse_cdf_by_actype(ax: Axes, df: pl.DataFrame, error_col: str, *, unit
     df = df.with_columns((pl.col(error_col) ** 2).alias("se"))
 
     grouped = (
-        df.group_by("aircraft_type")
+        df.with_columns(pl.col("aircraft_type").cast(pl.Enum(AIRCRAFT_TYPES)))
+        .group_by("aircraft_type")
         .agg(
             pl.col(error_col).alias("errors"),
             pl.mean("se").sqrt().alias("rmse"),
             pl.std("se").alias("std_se"),
             pl.len().alias("n"),
         )
-        .sort("rmse")
+        .sort("aircraft_type")
     )
 
     for row in grouped.iter_rows(named=True):
@@ -868,7 +784,7 @@ def predictions(
     _plot_rmse_cdf_by_actype(ax30, plot_df, "mae_rate", unit="kg/s")
     ax30.set_xlim(1e-3, 1e1)
     _plot_rmse_cdf_by_actype(ax31, plot_df, "mae_kg", unit="kg")
-    ax31.set_xlim(1e0, 1e4)
+    ax31.set_xlim(1e-1, 1e4)
 
     fig.colorbar(mappable, cax=cbar_ax, orientation="horizontal", label="Sequence Length")
 

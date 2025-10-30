@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Annotated, Literal, TypedDict
 
 import polars as pl
 
-from .. import PATH_DATA, PATH_DATA_RAW, FlightId, Partition, TypeCode
+from .. import PATH_DATA, PATH_DATA_RAW, AircraftType, FlightId, Partition
 
 if TYPE_CHECKING:
     import isqx
@@ -61,26 +61,59 @@ def download_from_s3(
 
 #
 # wrappers
+# makes sure timestamps in parquet are always read as UTC
+# because stdlib's `datetime` often treat naiive timestamps as local time
 #
 
 
-def scan_fuel(partition: Partition = "phase1", *, path_base: Path = PATH_DATA_RAW) -> pl.LazyFrame:
-    filename = (
-        "fuel_rank_submission.parquet" if partition == "rank" else f"fuel_{partition}.parquet"
+class FuelRecord(TypedDict):
+    idx: int
+    flight_id: FlightId
+    start: datetime
+    end: datetime
+    fuel_kg: Annotated[float, isqx.MASS(isqx.KG)]
+
+
+def scan_fuel(
+    partition: Partition = "phase1", *, path_base: Path = PATH_DATA_RAW
+) -> Annotated[pl.LazyFrame, FuelRecord]:
+    fp = path_base / f"fuel_{partition}.parquet"
+    # timestamps are in nanoseconds
+    return pl.scan_parquet(fp).with_columns(
+        pl.col("start").dt.replace_time_zone("UTC"), pl.col("end").dt.replace_time_zone("UTC")
     )
-    fp = path_base / filename
-    return pl.scan_parquet(fp)
+
+
+class FlightListRecord(TypedDict):
+    flight_id: FlightId
+    flight_date: datetime
+    takeoff: datetime
+    landed: datetime
+    origin_icao: str
+    origin_name: str
+    destination_icao: str
+    destination_name: str
+    aircraft_type: AircraftType
 
 
 def scan_flight_list(
     partition: Partition = "phase1", *, path_base: Path = PATH_DATA_RAW
-) -> pl.LazyFrame:
-    filename = f"flight_list_{partition}.parquet"
-    fp = path_base / filename
-    return pl.scan_parquet(fp)
+) -> Annotated[pl.LazyFrame, FlightListRecord]:
+    fp = path_base / f"flight_list_{partition}.parquet"
+    # timestamp are in seconds
+    return pl.scan_parquet(fp).with_columns(
+        pl.col("takeoff").dt.replace_time_zone("UTC"), pl.col("landed").dt.replace_time_zone("UTC")
+    )
 
 
-def scan_airports(*, path_base: Path = PATH_DATA_RAW) -> pl.LazyFrame:
+class AirportRecord(TypedDict):
+    icao: str
+    latitude: Annotated[float, isqx.LATITUDE(isqx.DEG)]
+    longitude: Annotated[float, isqx.LONGITUDE(isqx.DEG)]
+    elevation: Annotated[float, isqx.aerospace.GEOMETRIC_ALTITUDE(isqx.usc.FT)] | None
+
+
+def scan_airports(*, path_base: Path = PATH_DATA_RAW) -> Annotated[pl.LazyFrame, AirportRecord]:
     fp = path_base / "apt.parquet"
     return pl.scan_parquet(fp)
 
@@ -88,15 +121,15 @@ def scan_airports(*, path_base: Path = PATH_DATA_RAW) -> pl.LazyFrame:
 class TrajectoryRecord(TypedDict):
     timestamp: datetime
     flight_id: FlightId
-    typecode: TypeCode
-    latitude: Annotated[float, isqx.LATITUDE(isqx.DEG)]
+    typecode: AircraftType
+    latitude: Annotated[float, isqx.LATITUDE(isqx.DEG)] | None
     """Latitude, encoded via Compact Positional Reporting (CPR, tc=9-18, 20-22)
     We do not have access to uncertainty/quantisation, can be anywhere from:
 
     - navigational integrity category: nic=11 (rc < 7.5m)..nic=8 (rc < 185m)
     - navigational accuracy category: nacp=10 (epu < 10m)..nacp=8 (epu < 93m)"""
-    longitude: Annotated[float, isqx.LONGITUDE(isqx.DEG)]  # see above.
-    altitude: Annotated[float, isqx.aerospace.PRESSURE_ALTITUDE(isqx.usc.FT)]
+    longitude: Annotated[float, isqx.LONGITUDE(isqx.DEG)] | None  # see above.
+    altitude: Annotated[float, isqx.aerospace.PRESSURE_ALTITUDE(isqx.usc.FT)] | None
     """Barometric altitude (tc=9-18, 12-bit field). Not to be confused with GNSS altitude (tc=20-22)
 
     Quantisation: 'q' bit (bit 8 of the field):
@@ -104,7 +137,7 @@ class TrajectoryRecord(TypedDict):
     - q=0: 100-foot increments, using gray code for altitudes > 50,175 ft.
 
     Uncertainty: depends on barometric altitude quality (baq)."""
-    groundspeed: Annotated[float, isqx.aerospace.GS(isqx.usc.KNOT)]
+    groundspeed: Annotated[float, isqx.aerospace.GS(isqx.usc.KNOT)] | None
     """Ground speed (GNSS or inertial reference system, tc=19, subtypes1-2).
 
     Not transmitted directly, encoded as two signed velocity components (east-west velocity,
@@ -115,39 +148,43 @@ class TrajectoryRecord(TypedDict):
 
     Quantisation: 1 kt (subsonic), 4 kt (supersonic).
     Uncertainty: nacv=4 (< 0.3m/s), nacv=3 (< 1.0m/s), nacv=2 (< 3.0m/s), nacv=1 (< 10.0m/s)"""
-    track: Annotated[float, isqx.DEG]  # see above.
-    vertical_rate: Annotated[float, isqx.aerospace.VS(isqx.usc.FT * isqx.MIN**-1)]
+    track: Annotated[float, isqx.DEG] | None  # see above.
+    vertical_rate: Annotated[float, isqx.aerospace.VS(isqx.usc.FT * isqx.MIN**-1)] | None
     """Vertical rate (`vrsrc` specifies origin: GNSS or barometric, tc=19).
 
     a sign bit indicates climb or descent. a 9-bit value (vr) encodes the magnitude.
     vertical speed (ft/min) = 64 * (vr - 1).
 
     Uncertainty: linked to vertical component of nacv."""
-    mach: Annotated[float, isqx.MACH_NUMBER]
+    mach: Annotated[float, isqx.MACH_NUMBER] | None
     """Mach number (Mode S, BDS 6,0, 10 bits, mb 25-34).
 
     Quantisation: 0.004."""
-    TAS: Annotated[float, isqx.aerospace.TAS(isqx.usc.KNOT)]
+    TAS: Annotated[float, isqx.aerospace.TAS(isqx.usc.KNOT)] | None
     """True airspeed.
 
     - ADS-B (tc=19, subtype 3/4) - Quantisation: 1 kt (subtype 3), 4 kt (subtype 4).
     - Mode S (BDS 5,0 track and turn report, 10 bits, mb 47-56) - Quantisation: 2 kt"""
-    CAS: Annotated[float, isqx.aerospace.CAS(isqx.usc.KNOT)]
+    CAS: Annotated[float, isqx.aerospace.CAS(isqx.usc.KNOT)] | None
     """Calibrated airspeed. Not broadcast, but likely derived from indicated airspeed (BDS 6,0).
 
     Quantisation: 1 kt."""
-    source: Literal["adsb", "acars"]
+    source: Literal["adsb", "acars", "artificial"]
 
 
 def scan_all_trajectories(
     partition: Partition = "phase1", *, path_base: Path = PATH_DATA_RAW
 ) -> Annotated[pl.LazyFrame, TrajectoryRecord]:
     fp = path_base / f"flights_{partition}"
-    return pl.scan_parquet(f"{fp}/*.parquet")
+    return pl.scan_parquet(f"{fp}/*.parquet").with_columns(
+        pl.col("timestamp").dt.replace_time_zone("UTC"),
+    )
 
 
 def scan_trajectory(
     flight_id: str, partition: Partition = "phase1", *, path_base: Path = PATH_DATA_RAW
 ) -> Annotated[pl.LazyFrame, TrajectoryRecord]:
     fp = path_base / f"flights_{partition}" / f"{flight_id}.parquet"
-    return pl.scan_parquet(fp)
+    return pl.scan_parquet(fp).with_columns(
+        pl.col("timestamp").dt.replace_time_zone("UTC"),
+    )

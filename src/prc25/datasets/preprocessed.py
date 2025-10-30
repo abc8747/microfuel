@@ -7,26 +7,27 @@ from collections import namedtuple
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, TypedDict, get_args
 
+import numba as nb
 import numpy as np
 import polars as pl
-from numba import njit
 from rich.progress import track
 
-from .. import PATH_PREPROCESSED, Partition, Split, fpm2mps, ft2m, knot2mps
+from .. import PATH_PREPROCESSED, Coordinate2D, Partition, Split, fpm2mps, ft2m, knot2mps
 from . import raw
 
 if TYPE_CHECKING:
-    import datetime
+    from datetime import datetime
     from multiprocessing.synchronize import Event
     from typing import Annotated, Collection, Iterator, TypeAlias
 
     import isqx
     import isqx.aerospace
 
+    from .. import AirportIcao, FlightId
+
 
 logger = logging.getLogger(__name__)
-AcType: TypeAlias = str
-FlightId: TypeAlias = str
+
 TrajectoryFeature = Literal[
     "time_since_takeoff",
     "time_till_arrival",
@@ -39,7 +40,7 @@ TrajectoryFeature = Literal[
 TRAJECTORY_FEATURES = get_args(TrajectoryFeature)
 
 
-@njit(cache=True)
+@nb.njit(cache=True)
 def _kalman_filter(
     measurements: np.ndarray,
     dts: np.ndarray,
@@ -91,7 +92,7 @@ def _kalman_filter(
     return filtered_state_means, filtered_state_covariances
 
 
-@njit(cache=True)
+@nb.njit(cache=True)
 def _rts_smoother_numba(
     filtered_state_means: np.ndarray,
     filtered_state_covariances: np.ndarray,
@@ -245,7 +246,8 @@ def make_trajectories(
         .select("flight_id")
         .unique()
         .sort("flight_id")
-        .collect()["flight_id"]
+        .collect()
+        .to_series()
         .shuffle(seed=seed)
         .to_list()
     )
@@ -256,35 +258,94 @@ def make_trajectories(
     split_idx = int(len(flight_ids_with_fuel) * train_split)
     flight_ids_train = flight_ids_with_fuel[:split_idx]
     flight_ids_validation = flight_ids_with_fuel[split_idx:]
-    train_flight_ids_set = set(flight_ids_train)
+    flight_ids_train = set(flight_ids_train)
 
-    flight_id_to_takeoff = {
-        d["flight_id"]: d["takeoff"]
-        for d in flight_list_lf.select("flight_id", "takeoff").collect().iter_rows(named=True)
+    flight_id_to_flight: dict[FlightId, raw.FlightListRecord] = {
+        row["flight_id"]: row  # type: ignore
+        for row in flight_list_lf.collect().iter_rows(named=True)
     }
-    flight_id_to_landed = {
-        d["flight_id"]: d["landed"]
-        for d in flight_list_lf.select("flight_id", "landed").collect().iter_rows(named=True)
+    flight_id_to_segment: dict[FlightId, tuple[pl.Series, pl.Series]] = {
+        flight_id: (data["start"], data["end"])
+        for (flight_id,), data in fuel_lf.collect().group_by("flight_id")
     }
+    icao_to_coords: dict[AirportIcao, Coordinate2D[float]] = {
+        row["icao"]: Coordinate2D(lng=row["longitude"], lat=row["latitude"])
+        for row in raw.scan_airports().collect().iter_rows(named=True)
+    }  # type: ignore
 
-    train_trajectories: list[pl.LazyFrame] = []
-    validation_trajectories: list[pl.LazyFrame] = []
-
-    all_flight_ids = (
-        flight_list_lf.select("flight_id")
-        .unique()
-        .sort("flight_id")
-        .collect()["flight_id"]
-        .to_list()
-    )
-    for i, flight_id in enumerate(track(all_flight_ids, description="processing flights")):
+    trajectories_train: list[pl.LazyFrame] = []
+    trajectories_validation: list[pl.LazyFrame] = []
+    for i, flight_id in enumerate(track(flight_ids_with_fuel, description="processing flights")):
         traj_lf = raw.scan_trajectory(flight_id, partition)
-        full_traj_df = traj_lf.sort("timestamp").collect()
-        if full_traj_df.height <= 2:
-            continue
+        flight = flight_id_to_flight[flight_id]
+        timestamp_takeoff = flight["takeoff"]
+        timestamp_landed = flight["landed"]
+        ac_type = flight["aircraft_type"]
 
-        takeoff_ts = flight_id_to_takeoff[flight_id]
-        landed_ts = flight_id_to_landed[flight_id]
+        # segments can cover timestamps that are missing from the trajectory data, including
+        # timestamps that start before takeoff or end after landing.
+        # so we want to make sure one segment has at least 2 points (start and end) present
+        timestamps_segment_start, timestamps_segment_end = flight_id_to_segment[flight_id]
+        timestamps_required = (
+            pl.concat(
+                (
+                    pl.Series((timestamp_takeoff, timestamp_landed)).dt.cast_time_unit("ns"),
+                    timestamps_segment_start,
+                    timestamps_segment_end,
+                )
+            )
+            .unique()
+            .sort()
+        )
+
+        traj_df = traj_lf.collect()
+        timestamps_existing = traj_df.select("timestamp").to_series()
+        # takeoff time in flight list usually precedes the first timestamp in trajectory data
+        timestamps_missing = timestamps_required.filter(
+            ~timestamps_required.is_in(timestamps_existing)
+        )
+
+        if timestamps_missing.len() > 0:
+            # for required timestamps that are beyond what the trajectory data provides,
+            # we assume they are stationary on the ground, zero filling features
+            timestamp_gnd_start: datetime = min(timestamp_takeoff, timestamps_existing.min())  # type: ignore
+            timestamp_gnd_end: datetime = max(timestamp_landed, timestamps_existing.max())  # type: ignore
+            coord_origin, coord_dest = (
+                icao_to_coords[flight["origin_icao"]],
+                icao_to_coords[flight["destination_icao"]],
+            )  # we dont need elevation since altitude is barometric
+            trks: list[float] = traj_df.select("track").drop_nulls().to_series().to_list()
+            trk_start, trk_end = (trks[0], trks[-1]) if len(trks) else (0.0, 0.0)  # ffill/bfill
+
+            def _artificial(ts: datetime) -> raw.TrajectoryRecord:
+                if ts <= timestamp_gnd_start:
+                    val, lng, lat, trk = 0.0, coord_origin.lng, coord_origin.lat, trk_start
+                elif ts >= timestamp_gnd_end:
+                    val, lng, lat, trk = 0.0, coord_dest.lng, coord_dest.lat, trk_end
+                else:
+                    val, lng, lat, trk = None, None, None, None
+                return raw.TrajectoryRecord(
+                    timestamp=ts,
+                    flight_id=flight_id,
+                    typecode=ac_type,
+                    latitude=lat,
+                    longitude=lng,
+                    altitude=val,
+                    groundspeed=val,
+                    track=trk,
+                    vertical_rate=val,
+                    mach=val,
+                    TAS=val,
+                    CAS=val,
+                    source="artificial",
+                )
+
+            artificial_df = pl.DataFrame(_artificial(ts) for ts in timestamps_missing).with_columns(
+                pl.col("timestamp").dt.cast_time_unit("ns")
+            )
+            full_traj_df = traj_df.vstack(artificial_df).sort("timestamp")
+        else:
+            full_traj_df = traj_df.sort("timestamp")
 
         timestamp_s = full_traj_df["timestamp"].dt.epoch(time_unit="ms").to_numpy() / 1000.0
         vs_raw = fpm2mps(full_traj_df["vertical_rate"].to_numpy())
@@ -315,7 +376,7 @@ def make_trajectories(
         gs_res = smooth_time_series(
             values=gs_with_nan,
             dts_s=dts_s,
-            process_noise_variances=(1.0**2, 0.5**2),
+            process_noise_variances=(1.0**2, 0.1**2),
             observation_noise_variance=6.0**2,
         )
 
@@ -334,9 +395,13 @@ def make_trajectories(
         )
 
         if i < 100 or (plot_every_n_flights is not None and i % plot_every_n_flights == 0):
+            # import matplotlib
             import matplotlib.pyplot as plt
             from matplotlib.gridspec import GridSpec
 
+            from .. import PATH_PLOTS_OUTPUT
+
+            # matplotlib.use("WebAgg")
             fig = plt.figure(figsize=(20, 12), constrained_layout=True)
             gs = GridSpec(3, 2, figure=fig)
 
@@ -346,6 +411,14 @@ def make_trajectories(
 
             ax_gs = fig.add_subplot(gs[0, 1])
             ax_gsrate = fig.add_subplot(gs[1, 1], sharex=ax_gs)
+
+            for ax in [ax_alt, ax_vs, ax_vaccel, ax_gs, ax_gsrate]:
+                ax.axvline(timestamp_takeoff.timestamp(), color="green", linewidth=0.5)
+                ax.axvline(timestamp_landed.timestamp(), color="blue", linewidth=0.5)
+                for j, (start_ts, end_ts) in enumerate(
+                    zip(timestamps_segment_start, timestamps_segment_end)
+                ):
+                    ax.axvspan(start_ts.timestamp(), end_ts.timestamp(), color=f"C{j}", alpha=0.1)
 
             ax_alt.plot(timestamp_s, alt_raw, "k.", markersize=2, alpha=0.3, label="raw altitude")
             ax_alt.plot(
@@ -467,10 +540,11 @@ def make_trajectories(
             plt.setp(ax_gs.get_xticklabels(), visible=False)
             fig.suptitle(f"flight id: {flight_id}")
 
-            output_dir = path_base / "plots" / "rts_smoother"
+            # plt.show()
+            output_dir = PATH_PLOTS_OUTPUT / "preprocessed_trajectories"
             output_dir.mkdir(exist_ok=True, parents=True)
             output_path = output_dir / f"{partition}_{flight_id}.png"
-            fig.savefig(output_path)
+            fig.savefig(output_path, dpi=300)
             plt.close(fig)
 
         # its possible that the very start of the smoothed data isn't processed
@@ -478,12 +552,12 @@ def make_trajectories(
         processed_traj_df = pl.DataFrame(
             {
                 "timestamp": full_traj_df["timestamp"],
-                "time_since_takeoff": (full_traj_df["timestamp"] - takeoff_ts).dt.total_seconds(
-                    fractional=True
-                ),
-                "time_till_arrival": (landed_ts - full_traj_df["timestamp"]).dt.total_seconds(
-                    fractional=True
-                ),
+                "time_since_takeoff": (
+                    full_traj_df["timestamp"] - timestamp_takeoff
+                ).dt.total_seconds(fractional=True),
+                "time_till_arrival": (
+                    timestamp_landed - full_traj_df["timestamp"]
+                ).dt.total_seconds(fractional=True),
                 "vertical_rate": _np_interpolate(vs_res.smoothed_values, timestamp_s),
                 "vertical_accel": _np_interpolate(vertical_accel_with_nan, timestamp_s),
                 "vertical_rate_is_outlier": (vs_outlier_mask | np.isnan(vs_res.smoothed_values)),
@@ -497,14 +571,14 @@ def make_trajectories(
             }
         ).with_columns(pl.lit(flight_id).alias("flight_id"))
 
-        if flight_id in train_flight_ids_set:
-            train_trajectories.append(processed_traj_df.lazy())
+        if flight_id in flight_ids_train:
+            trajectories_train.append(processed_traj_df.lazy())
         elif flight_id in flight_ids_validation:
-            validation_trajectories.append(processed_traj_df.lazy())
+            trajectories_validation.append(processed_traj_df.lazy())
 
     for split, trajectories in [
-        ("train", train_trajectories),
-        ("validation", validation_trajectories),
+        ("train", trajectories_train),
+        ("validation", trajectories_validation),
     ]:
         output_path = path_base / f"trajectories_{partition}_{split}.parquet"
         stop_event = multiprocessing.Event()
@@ -552,9 +626,19 @@ class Stat(TypedDict):
 Stats: TypeAlias = dict[TrajectoryFeature, Stat]
 
 
-def make_standardisation_stats(partition: Partition, *, path_base: Path = PATH_PREPROCESSED):
+def make_standardisation_stats(
+    partition: Partition,
+    subset_fraction: float | None = 0.8,
+    *,
+    path_base: Path = PATH_PREPROCESSED,
+):
     train_traj_lf = pl.scan_parquet(path_base / f"trajectories_{partition}_train.parquet")
     train_flight_ids = train_traj_lf.select("flight_id").unique().collect()["flight_id"].to_list()
+
+    if subset_fraction is not None:  # hack to avoid OOM
+        n_flights = len(train_flight_ids)
+        train_flight_ids = train_flight_ids[: int(n_flights * subset_fraction)]
+    logger.info(f"computing standardisation stats from {len(train_flight_ids)} train flights")
 
     trajectory_iterator = TrajectoryIterator(
         partition=partition,
@@ -602,10 +686,10 @@ def load_standardisation_stats(
 class TrajectoryInfo(TypedDict):
     idx: int
     flight_id: str
-    start: datetime.datetime
-    end: datetime.datetime
+    start: datetime
+    end: datetime
     fuel_kg: float
-    takeoff: datetime.datetime
+    takeoff: datetime
     aircraft_type: str
 
 
