@@ -64,7 +64,7 @@ class VarlenDataset(Dataset):
             )
 
             duration_s = (trajectory.info["end"] - trajectory.info["start"]).total_seconds()
-            target = np.log((trajectory.info["fuel_kg"] / duration_s) + 1.0)
+            target = np.log1p((trajectory.info["fuel_kg"] / duration_s))
 
             ac_type_idx = self.ac_type_vocab.get(
                 trajectory.info["aircraft_type"], self.ac_type_vocab["UNK"]

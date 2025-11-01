@@ -47,6 +47,21 @@ class Pooler(nn.Module):
             raise ValueError(f"unknown {self.mode=}")
 
 
+class LinearAttentionBlock(nn.Module):
+    def __init__(self, hidden_size: int, num_heads: int, head_dim: int):
+        super().__init__()
+        self.norm = ZeroCentredRMSNorm(hidden_size)
+        self.gdn = GatedDeltaNet(hidden_size=hidden_size, num_heads=num_heads, head_dim=head_dim)
+
+    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.norm(x)
+        x, _, _ = self.gdn(x.unsqueeze(0), cu_seqlens=cu_seqlens)
+        x = x.squeeze(0)
+        x = x + residual
+        return x
+
+
 @dataclass
 class FuelBurnPredictorConfig:
     input_dim: int
@@ -54,6 +69,7 @@ class FuelBurnPredictorConfig:
     num_heads: int
     num_aircraft_types: int
     aircraft_embedding_dim: int
+    num_layers: int
 
 
 class FuelBurnPredictor(nn.Module):
@@ -85,9 +101,11 @@ class FuelBurnPredictor(nn.Module):
 
         self.aircraft_embedding = nn.Embedding(cfg.num_aircraft_types, cfg.aircraft_embedding_dim)
         self.input_proj = nn.Linear(cfg.input_dim + cfg.aircraft_embedding_dim, cfg.hidden_size)
-        self.norm = ZeroCentredRMSNorm(cfg.hidden_size)
-        self.gdn = GatedDeltaNet(
-            hidden_size=cfg.hidden_size, num_heads=cfg.num_heads, head_dim=head_dim
+        self.layers = nn.ModuleList(
+            [
+                LinearAttentionBlock(cfg.hidden_size, cfg.num_heads, head_dim)
+                for _ in range(cfg.num_layers)
+            ]
         )
         self.pooler = Pooler()
         self.regression_head = nn.Linear(cfg.hidden_size, 1)
@@ -104,11 +122,8 @@ class FuelBurnPredictor(nn.Module):
         x = torch.cat([x, ac_embeddings_repeated], dim=1)
         x = self.input_proj(x)
 
-        residual = x
-        x = self.norm(x)
-        x, _, _ = self.gdn(x.unsqueeze(0), cu_seqlens=cu_seqlens)
-        x = x.squeeze(0)
-        x = x + residual
+        for layer in self.layers:
+            x = layer(x, cu_seqlens)
 
         pooled_x = self.pooler(x, cu_seqlens)
         y_pred = self.regression_head(pooled_x)

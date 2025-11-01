@@ -628,7 +628,7 @@ Stats: TypeAlias = dict[TrajectoryFeature, Stat]
 
 def make_standardisation_stats(
     partition: Partition,
-    subset_fraction: float | None = 0.8,
+    subset_fraction: float | None = None,
     *,
     path_base: Path = PATH_PREPROCESSED,
 ):

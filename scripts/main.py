@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, Literal, assert_never
 
 import typer
 from rich.logging import RichHandler
@@ -97,14 +97,19 @@ class Checkpoint:
 def train(
     partition: Partition = "phase1",
     batch_size: int = 64,
-    epochs: int = 10,
+    epochs: int = 15,
     lr: float = 3e-4,
     hidden_size: int = 32,
     num_heads: int = 2,
+    num_layers: int = 1,
     aircraft_embedding_dim: int = 8,
     *,
     project_name: str = "prc25-multiac",
-    exp_name: str = "gdn-all_ac-v0.0.4",
+    exp_name: str = "gdn-all_ac-v0.0.4+1layer+noduration+ft",
+    resume_from: Annotated[
+        Path | None, typer.Option(help="Path to checkpoint to resume training from.")
+    ] = None,
+    loss_type: Literal["rmse_rate", "rmse_kg"] = "rmse_rate",
     evaluate_best: Annotated[
         bool, typer.Option(help="Evaluate the best model on the validation set after training.")
     ] = True,
@@ -145,6 +150,7 @@ def train(
         num_heads=num_heads,
         num_aircraft_types=len(train_dataset.ac_type_vocab),
         aircraft_embedding_dim=aircraft_embedding_dim,
+        num_layers=num_layers,
     )
     cfg = TrainConfig(
         partition=partition,
@@ -159,6 +165,12 @@ def train(
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"using device: {device}")
+
+    checkpoint: Checkpoint | None = None
+    if resume_from and resume_from.exists():
+        logger.info(f"loading checkpoint from {resume_from}")
+        with torch.serialization.safe_globals([Checkpoint, TrainConfig, FuelBurnPredictorConfig]):
+            checkpoint = torch.load(resume_from, map_location=device)
 
     exp_checkpoint_dir = PATH_CHECKPOINTS / cfg.exp_name
     exp_checkpoint_dir.mkdir(exist_ok=True, parents=True)
@@ -177,6 +189,12 @@ def train(
 
     model.to(device)
     scaler = torch.amp.GradScaler(device=device, enabled=(device == "cuda"))
+
+    if checkpoint:
+        # NOTE: assuming reloading from checkpoint to be used for finetuning
+        # so we do not restore optimiser and scaler states!
+        model.load_state_dict(checkpoint.model_state_dict)
+
     global_step = 0
     best_val_rmse = float("inf")
 
@@ -208,8 +226,12 @@ def train(
                     device_type=device, dtype=torch.bfloat16, enabled=(device == "cuda")
                 ):
                     y_pred_log = model(x, cu_seqlens, aircraft_type_idx)
-                    loss_unweighted = criterion(y_pred_log, y_log)
-                    loss = (loss_unweighted * durations.unsqueeze(1)).mean()
+                    if loss_type == "rmse_rate":
+                        loss = criterion(y_pred_log, y_log).mean()
+                    elif loss_type == "rmse_kg":
+                        loss = (criterion(y_pred_log, y_log) * durations.unsqueeze(1)).mean()
+                    else:
+                        assert_never(loss_type)
 
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -225,7 +247,9 @@ def train(
                     )
                     if rmse_kg_val < best_val_rmse:
                         best_val_rmse = rmse_kg_val
-                        checkpoint_path = exp_checkpoint_dir / "best.pt"
+                        checkpoint_path = (
+                            exp_checkpoint_dir / f"step{global_step:05}_{best_val_rmse:.2f}.pt"
+                        )
                         checkpoint = Checkpoint(
                             model_state_dict=model.state_dict(),
                             optimizer_state_dict=optimizer.state_dict(),
@@ -245,8 +269,8 @@ def train(
                 global_step += 1
 
                 with torch.no_grad():
-                    y_pred_rate_orig = torch.exp(y_pred_log.detach()) - 1.0
-                    y_true_rate_orig = torch.exp(y_log.detach()) - 1.0
+                    y_pred_rate_orig = torch.expm1(y_pred_log.detach())
+                    y_true_rate_orig = torch.expm1(y_log.detach())
                     rmse_rate_orig = torch.sqrt(
                         torch.nn.functional.mse_loss(y_pred_rate_orig, y_true_rate_orig)
                     ).item()
@@ -270,11 +294,16 @@ def train(
 
     if evaluate_best:
         logger.info("evaluating best model on validation set")
-        best_checkpoint_path = exp_checkpoint_dir / "best.pt"
-        if best_checkpoint_path.exists():
-            evaluate(best_checkpoint_path, partition, "validation", batch_size)
-        else:
+        best_val, best_checkpoint_path = float("inf"), None
+        for f in exp_checkpoint_dir.iterdir():
+            if f.suffix != ".pt" or (val := float(f.stem.split("_")[1])) >= best_val:
+                continue
+            best_val = val
+            best_checkpoint_path = f
+        if best_checkpoint_path is None:
             logger.warning("no best model checkpoint found to evaluate.")
+            return
+        evaluate(best_checkpoint_path, partition, "validation", batch_size)
 
 
 def _run_evaluation(
@@ -306,8 +335,8 @@ def _run_evaluation(
             ):
                 y_pred_log = model(x, cu_seqlens, aircraft_type_idx)
 
-            y_pred_orig = torch.exp(y_pred_log) - 1.0
-            y_true_orig = torch.exp(y_log) - 1.0
+            y_pred_orig = torch.expm1(y_pred_log)
+            y_true_orig = torch.expm1(y_log)
 
             all_preds.append(y_pred_orig.cpu())
             all_trues.append(y_true_orig.cpu())
