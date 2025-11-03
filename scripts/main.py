@@ -105,7 +105,7 @@ def train(
     aircraft_embedding_dim: int = 8,
     *,
     project_name: str = "prc25-multiac",
-    exp_name: str = "gdn-all_ac-v0.0.4+1layer+noduration+ft",
+    exp_name: str = "gdn-all_ac-v0.0.4+1layer+noduration",
     resume_from: Annotated[
         Path | None, typer.Option(help="Path to checkpoint to resume training from.")
     ] = None,

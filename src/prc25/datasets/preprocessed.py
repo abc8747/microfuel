@@ -34,8 +34,6 @@ TrajectoryFeature = Literal[
     "altitude",
     "groundspeed",
     "vertical_rate",
-    # "vertical_accel",
-    # "groundspeed_rate",
 ]
 TRAJECTORY_FEATURES = get_args(TrajectoryFeature)
 
@@ -126,15 +124,7 @@ def _rts_smoother_numba(
     return smoothed_state_means, smoothed_state_covariances
 
 
-SmoothResult = namedtuple(
-    "SmoothResult",
-    [
-        "smoothed_values",
-        "smoothed_derivatives",
-        "smoothed_value_variances",
-        "smoothed_derivative_variances",
-    ],
-)
+SmoothResult = namedtuple("SmoothResult", ["val", "val_d", "var_val", "var_val_d"])
 
 
 def smooth_time_series(
@@ -226,8 +216,8 @@ def make_trajectories(
     path_base: Path = PATH_PREPROCESSED,
     altitude_max: Annotated[float, isqx.aerospace.PRESSURE_ALTITUDE(isqx.M)] = ft2m(50000),
     speed_max: Annotated[float, isqx.SPEED(isqx.M_PERS)] = knot2mps(800),
+    speed_roll: Annotated[float, isqx.SPEED(isqx.M_PERS)] = knot2mps(120),
     vertical_speed_max: Annotated[float, isqx.aerospace.VS(isqx.M_PERS)] = fpm2mps(8000),
-    vertical_accel_max: Annotated[float, isqx.M_PERS2] = 3.0,
     groundspeed_rate_max: Annotated[float, isqx.aerospace.GS(isqx.M_PERS)] = 1.5,
     plot_every_n_flights: int | None = None,
 ):
@@ -380,55 +370,38 @@ def make_trajectories(
             observation_noise_variance=6.0**2,
         )
 
-        vertical_accel_raw = vs_res.smoothed_derivatives
-        groundspeed_rate_raw = gs_res.smoothed_derivatives
-
-        vertical_accel_with_nan = np.where(
-            (np.abs(vertical_accel_raw) > vertical_accel_max) | np.isnan(vertical_accel_raw),
-            np.nan,
-            vertical_accel_raw,
-        )
-        groundspeed_rate_with_nan = np.where(
-            (np.abs(groundspeed_rate_raw) > groundspeed_rate_max) | np.isnan(groundspeed_rate_raw),
-            np.nan,
-            groundspeed_rate_raw,
-        )
-
         if i < 100 or (plot_every_n_flights is not None and i % plot_every_n_flights == 0):
-            # import matplotlib
             import matplotlib.pyplot as plt
             from matplotlib.gridspec import GridSpec
 
             from .. import PATH_PLOTS_OUTPUT
 
-            # matplotlib.use("WebAgg")
-            fig = plt.figure(figsize=(20, 12), constrained_layout=True)
-            gs = GridSpec(3, 2, figure=fig)
+            N_PLOTS = 3
+            fig = plt.figure(figsize=(9, 9 * N_PLOTS * 0.75), layout="tight")
+            gs = GridSpec(N_PLOTS, 1, figure=fig)
 
-            ax_alt = fig.add_subplot(gs[0, 0])
-            ax_vs = fig.add_subplot(gs[1, 0], sharex=ax_alt)
-            ax_vaccel = fig.add_subplot(gs[2, 0], sharex=ax_alt)
+            ax_alt = fig.add_subplot(gs[0])
+            ax_vs = fig.add_subplot(gs[1], sharex=ax_alt)
+            ax_gs = fig.add_subplot(gs[2], sharex=ax_alt)
 
-            ax_gs = fig.add_subplot(gs[0, 1])
-            ax_gsrate = fig.add_subplot(gs[1, 1], sharex=ax_gs)
-
-            for ax in [ax_alt, ax_vs, ax_vaccel, ax_gs, ax_gsrate]:
+            for ax in [ax_alt, ax_vs, ax_gs]:
+                if ax != ax_gs:
+                    plt.setp(ax.get_xticklabels(), visible=False)
                 ax.axvline(timestamp_takeoff.timestamp(), color="green", linewidth=0.5)
                 ax.axvline(timestamp_landed.timestamp(), color="blue", linewidth=0.5)
                 for j, (start_ts, end_ts) in enumerate(
                     zip(timestamps_segment_start, timestamps_segment_end)
                 ):
                     ax.axvspan(start_ts.timestamp(), end_ts.timestamp(), color=f"C{j}", alpha=0.1)
+                ax.grid(True, linewidth=0.2)
 
             ax_alt.plot(timestamp_s, alt_raw, "k.", markersize=2, alpha=0.3, label="raw altitude")
-            ax_alt.plot(
-                timestamp_s, alt_res.smoothed_values, "r-", linewidth=0.5, label="smoothed altitude"
-            )
-            alt_std = np.sqrt(alt_res.smoothed_value_variances)
+            ax_alt.plot(timestamp_s, alt_res.val, "r-", linewidth=0.5, label="smoothed altitude")
+            alt_std = np.sqrt(alt_res.var_val)
             ax_alt.fill_between(
                 timestamp_s,
-                alt_res.smoothed_values - alt_std,
-                alt_res.smoothed_values + alt_std,
+                alt_res.val - alt_std,
+                alt_res.val + alt_std,
                 color="r",
                 alpha=0.2,
                 label=r"$\pm 1 \sigma$",
@@ -436,30 +409,29 @@ def make_trajectories(
             ax_alt.set_ylabel("altitude (m)")
             ax_alt.set_ylim(0, altitude_max)
             ax_alt.legend()
-            ax_alt.grid(True, alpha=0.3)
 
             ax_vs.plot(
                 timestamp_s, vs_raw, "k.", markersize=2, alpha=0.3, label="raw vertical rate"
             )
             ax_vs.plot(
                 timestamp_s,
-                vs_res.smoothed_values,
+                vs_res.val,
                 "r-",
                 linewidth=0.5,
                 label="smoothed vertical rate",
             )
             ax_vs.plot(
                 timestamp_s,
-                alt_res.smoothed_derivatives,
+                alt_res.val_d,
                 "b--",
                 linewidth=0.5,
                 label="smoothed altitude derivative",
             )
-            vs_std = np.sqrt(vs_res.smoothed_value_variances)
+            vs_std = np.sqrt(vs_res.var_val)
             ax_vs.fill_between(
                 timestamp_s,
-                vs_res.smoothed_values - vs_std,
-                vs_res.smoothed_values + vs_std,
+                vs_res.val - vs_std,
+                vs_res.val + vs_std,
                 color="r",
                 alpha=0.2,
                 label=r"$\pm 1 \sigma$ (vs)",
@@ -467,43 +439,20 @@ def make_trajectories(
             ax_vs.set_ylabel("vertical rate (m/s)")
             ax_vs.set_ylim(-vertical_speed_max, vertical_speed_max)
             ax_vs.legend()
-            ax_vs.grid(True, alpha=0.3)
-
-            ax_vaccel.plot(
-                timestamp_s,
-                vertical_accel_raw,
-                "g-",
-                linewidth=0.5,
-                label="smoothed vertical acceleration",
-            )
-            vs_accel_std = np.sqrt(vs_res.smoothed_derivative_variances)
-            ax_vaccel.fill_between(
-                timestamp_s,
-                vertical_accel_raw - vs_accel_std,
-                vertical_accel_raw + vs_accel_std,
-                color="g",
-                alpha=0.2,
-                label=r"$\pm 1 \sigma$",
-            )
-            ax_vaccel.set_ylabel("vertical accel (m/s²)")
-            ax_vaccel.set_xlabel("time (s)")
-            ax_vaccel.set_ylim(-vertical_accel_max, vertical_accel_max)
-            ax_vaccel.legend()
-            ax_vaccel.grid(True, alpha=0.3)
 
             ax_gs.plot(timestamp_s, gs_raw, "k.", markersize=2, alpha=0.3, label="raw groundspeed")
             ax_gs.plot(
                 timestamp_s,
-                gs_res.smoothed_values,
+                gs_res.val,
                 "r-",
                 linewidth=0.5,
                 label="smoothed groundspeed",
             )
-            gs_std = np.sqrt(gs_res.smoothed_value_variances)
+            gs_std = np.sqrt(gs_res.var_val)
             ax_gs.fill_between(
                 timestamp_s,
-                gs_res.smoothed_values - gs_std,
-                gs_res.smoothed_values + gs_std,
+                gs_res.val - gs_std,
+                gs_res.val + gs_std,
                 color="r",
                 alpha=0.2,
                 label=r"$\pm 1 \sigma$",
@@ -511,33 +460,9 @@ def make_trajectories(
             ax_gs.set_ylabel("groundspeed (m/s)")
             ax_gs.set_ylim(0, speed_max)
             ax_gs.legend()
-            ax_gs.grid(True, alpha=0.3)
 
-            ax_gsrate.plot(
-                timestamp_s,
-                groundspeed_rate_raw,
-                "g-",
-                linewidth=0.5,
-                label="smoothed groundspeed rate",
-            )
-            gs_rate_std = np.sqrt(gs_res.smoothed_derivative_variances)
-            ax_gsrate.fill_between(
-                timestamp_s,
-                groundspeed_rate_raw - gs_rate_std,
-                groundspeed_rate_raw + gs_rate_std,
-                color="g",
-                alpha=0.2,
-                label=r"$\pm 1 \sigma$",
-            )
-            ax_gsrate.set_ylabel("groundspeed rate (m/s²)")
-            ax_gsrate.set_xlabel("time (s)")
-            ax_gsrate.set_ylim(-groundspeed_rate_max, groundspeed_rate_max)
-            ax_gsrate.legend()
-            ax_gsrate.grid(True, alpha=0.3)
+            ax_gs.set_xlabel("time (s)")
 
-            plt.setp(ax_alt.get_xticklabels(), visible=False)
-            plt.setp(ax_vs.get_xticklabels(), visible=False)
-            plt.setp(ax_gs.get_xticklabels(), visible=False)
             fig.suptitle(f"flight id: {flight_id}")
 
             # plt.show()
@@ -558,16 +483,12 @@ def make_trajectories(
                 "time_till_arrival": (
                     timestamp_landed - full_traj_df["timestamp"]
                 ).dt.total_seconds(fractional=True),
-                "vertical_rate": _np_interpolate(vs_res.smoothed_values, timestamp_s),
-                "vertical_accel": _np_interpolate(vertical_accel_with_nan, timestamp_s),
-                "vertical_rate_is_outlier": (vs_outlier_mask | np.isnan(vs_res.smoothed_values)),
-                # "vertical_accel_is_outlier": vertical_accel_outlier_mask,
-                "altitude": _np_interpolate(alt_res.smoothed_values, timestamp_s),
-                "altitude_is_outlier": (alt_outlier_mask | np.isnan(alt_res.smoothed_values)),
-                "groundspeed": _np_interpolate(gs_res.smoothed_values, timestamp_s),
-                "groundspeed_rate": _np_interpolate(groundspeed_rate_with_nan, timestamp_s),
-                "groundspeed_is_outlier": (gs_outlier_mask | np.isnan(gs_res.smoothed_values)),
-                # "groundspeed_rate_is_outlier": groundspeed_rate_outlier_mask,
+                "vertical_rate": _np_interpolate(vs_res.val, timestamp_s),
+                "vertical_rate_is_outlier": (vs_outlier_mask | np.isnan(vs_res.val)),
+                "altitude": _np_interpolate(alt_res.val, timestamp_s),
+                "altitude_is_outlier": (alt_outlier_mask | np.isnan(alt_res.val)),
+                "groundspeed": _np_interpolate(gs_res.val, timestamp_s),
+                "groundspeed_is_outlier": (gs_outlier_mask | np.isnan(gs_res.val)),
             }
         ).with_columns(pl.lit(flight_id).alias("flight_id"))
 

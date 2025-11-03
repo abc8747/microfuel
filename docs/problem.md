@@ -79,40 +79,46 @@ the rmse of each version should not be compared between each other.
   - implemented constant-velocity kalman filter / rts smoother for {barometric altitude, inertial vertical rate, ground speed}:
     (0.3861 ± 0.0142) kg/s | (212.58 ± 16.32) kg
     faster convergence, rmse for short segments improved due to smoother estimates, but performance did not appreciably improve for longer segments (in fact, slightly worsened!)
-  - adding $\dot{VS}$ or $\dot{GS}$ did not seem to improve RMSE.
 - v0.0.4
   - ³ A bug that caused nondeterministic runs was fixed, and also includes segments with zero trajectory points.
+- v0.0.5
+  - $\theta = \arcsin(\frac{\text{VS}}{V})$
+  - assuming point mass, quasisteady flight, coordinated turn / no sideslip (also: $V = V_\text{gs}$, $\phi = 0$, no wind effect, but we can relax this in the future)
+    - specific energy $\frac{T - D}{m} = \underbrace{\frac{dV}{dt} + g \frac{dh}{dt}}_{\text{Specific Energy Rate}} + \text{wind effect}$ worsened performance, $\frac{dV}{dt}$ is the culprit.
+    - coefficient of lift proxy $\frac{C_L S}{m} = \frac{g\cos\gamma}{\frac{1}{2}\rho V^2 \cos\phi}$ worsened performance
+    - $\sin\gamma$ worsened performance
 
-| notes                                                   | rmse(kg/s)        | rmse(kg)         |
-| ------------------------------------------------------- | ----------------- | ---------------- |
-| v0.0.2                                                  | 0.3915 ± 0.0146²³ | 212.76 ± 16.52²³ |
-| v0.0.3                                                  | 0.3859 ± 0.0136²³ | 217.29 ± 15.90²³ |
-| v0.0.3 + $t_\text{end} - t_i$                           | 0.3779 ± 0.0141³  | 212.45 ± 16.93³  |
-| v0.0.3 + $t_\text{end} - t_i$ + $\dot{VS}$ + $\dot{GS}$ | 0.3794 ± 0.0136³  | 212.19 ± 16.25³  |
-| v0.0.4 (includes `seq_len` < 2)                         | 0.4182 ± 0.0138   | 218.87 ± 18.55   |
-| v0.0.4 + rmse(kg/s)                                     | 0.3876 ± 0.0134   | 220.17 ± 17.46   |
-| v0.0.4 + rmse(kg/s) + finetuned on rmse(kg)             | 0.4040 ± 0.0134   | 211.80 ± 18.68   |
+| notes                                                   | rmse(kg/s)        | rmse(kg)           |
+| ------------------------------------------------------- | ----------------- | ------------------ |
+| v0.0.2                                                  | 0.3915 ± 0.0146²³ | 212.76 ± 16.52²³   |
+| v0.0.3                                                  | 0.3859 ± 0.0136²³ | 217.29 ± 15.90²³   |
+| v0.0.3 + $t_\text{end} - t_i$                           | 0.3779 ± 0.0141³  | 212.45 ± 16.93³    |
+| v0.0.3 + $t_\text{end} - t_i$ + $\dot{VS}$ + $\dot{GS}$ | 0.3794 ± 0.0136³  | 212.19 ± 16.25³    |
+| v0.0.4 (includes `seq_len` < 2)                         | 0.4182 ± 0.0138   | 218.87 ± 18.55     |
+| v0.0.4 + rmse(kg/s)                                     | 0.3876 ± 0.0134   | 220.17 ± 17.46     |
+| v0.0.4 + rmse(kg/s) + finetuned on rmse(kg)             | 0.4040 ± 0.0134   | **211.80 ± 18.68** |
+| v0.0.4 + specific energy                                | 0.3917            | 226.49             |
+| v0.0.4 + coefficient of lift proxy                      | 0.3921            | 224.85             |
+| v0.0.4 + $\sqrt{\rho/\rho_0}$                           | 0.3870            | 222.00             |
 
 ## TODO
 
 ### data
 
-- split gs, track -> vew, vns then separately filter that. do the same for lat/lng. $\phi = \arctan(\frac{V\dot{\phi}}{g})$
-- google-arco era5: temperature, pressure and uv at flight level; isa deviation, $V_{g} \rightarrow V$, $\rho = \frac{p}{\rho R T}$.
-- $\theta = \arcsin(\frac{\text{VS}}{V})$
-- assuming point mass, quasisteady flight, coordinated turn / no sideslip
-  - $\frac{C_L S}{m} = \frac{g\cos\gamma}{\frac{1}{2}\rho V^2 \cos\phi}$
-  - $\frac{T - D}{m} = \underbrace{V \frac{dV}{dt} + g \frac{dh}{dt}}_{\text{Specific Energy Rate}} + \text{wind effect}$
 - handle outliers robustly:
   - `prc770867379`, `prc770868424`: weird drops in altitude
     - in cases where this happens, ground speed is also similarity affected: data corrupted?
   - `prc770844923`: weird peaks in vertical_rate
-  - between large time gaps where altitude is at cruising level and vertical rate is missing, heuristic: we should make it zero instead of interpolating
+- split gs, track -> vew, vns then separately filter that. do the same for lat/lng. $\phi = \arctan(\frac{V\dot{\phi}}{g})$
+- google-arco era5: temperature, pressure and uv at flight level; isa deviation, $V_{g} \rightarrow V$, $\rho = \frac{p}{\rho R T}$.
+- between large time gaps where altitude is at cruising level and vertical rate is missing, heuristic: we should make it zero instead of interpolating
 - <https://github.com/DGAC/Acropole> - maybe use their final layer outputs?
+- dataloader seed does not update on each iter!
 
 misc
 
 - add fraction of time elapsed in segment, not $\Delta t$ since it harms performance
+- roll the time since takeoff
 - parameterise the sequence length being predicted
 
 ### model
