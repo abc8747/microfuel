@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     import isqx
     import isqx.aerospace
 
-    from .. import AirportIcao, FlightId
+    from .. import AirportIcao, FlightId, Split
 
 
 logger = logging.getLogger(__name__)
@@ -34,8 +34,48 @@ TrajectoryFeature = Literal[
     "altitude",
     "groundspeed",
     "vertical_rate",
+    # "track_rate",
 ]
 TRAJECTORY_FEATURES = get_args(TrajectoryFeature)
+
+
+def make_splits(
+    partition: Partition,
+    train_split: float = 0.8,
+    seed: int = 13,
+    *,
+    path_base: Path = PATH_PREPROCESSED,
+):
+    path_base.mkdir(exist_ok=True, parents=True)
+    flight_list_lf = raw.scan_flight_list(partition)
+    fuel_lf = raw.scan_fuel(partition)
+
+    flight_ids_with_fuel = (
+        flight_list_lf.join(fuel_lf, on="flight_id")
+        .select("flight_id")
+        .unique()
+        .sort("flight_id")
+        .collect()
+        .to_series()
+        .shuffle(seed=seed)
+        .to_list()
+    )
+    logger.info(
+        f"found {len(flight_ids_with_fuel)} flights with fuel data in partition `{partition}`"
+    )
+
+    split_idx = int(len(flight_ids_with_fuel) * train_split)
+    flight_ids_train = flight_ids_with_fuel[:split_idx]
+    flight_ids_validation = flight_ids_with_fuel[split_idx:]
+
+    splits: dict[Split, list[FlightId]] = {
+        "train": flight_ids_train,
+        "validation": flight_ids_validation,
+    }
+    output_path = path_base / f"splits_{partition}.json"
+    with open(output_path, "w") as f:
+        json.dump(splits, f)
+    logger.info(f"wrote splits to {output_path}")
 
 
 @nb.njit(cache=True)
@@ -210,15 +250,13 @@ def _np_interpolate(y: np.ndarray, x: np.ndarray) -> np.ndarray:
 
 def make_trajectories(
     partition: Partition,
-    train_split: float = 0.8,
     seed: int = 13,
     *,
     path_base: Path = PATH_PREPROCESSED,
     altitude_max: Annotated[float, isqx.aerospace.PRESSURE_ALTITUDE(isqx.M)] = ft2m(50000),
     speed_max: Annotated[float, isqx.SPEED(isqx.M_PERS)] = knot2mps(800),
-    speed_roll: Annotated[float, isqx.SPEED(isqx.M_PERS)] = knot2mps(120),
     vertical_speed_max: Annotated[float, isqx.aerospace.VS(isqx.M_PERS)] = fpm2mps(8000),
-    groundspeed_rate_max: Annotated[float, isqx.aerospace.GS(isqx.M_PERS)] = 1.5,
+    track_rate_max: Annotated[float, isqx.RAD_PERS] = 0.003,
     plot_every_n_flights: int | None = None,
 ):
     """Creates train/validation split of preprocessed trajectories.
@@ -245,11 +283,6 @@ def make_trajectories(
         f"found {len(flight_ids_with_fuel)} flights with fuel data in partition `{partition}`"
     )
 
-    split_idx = int(len(flight_ids_with_fuel) * train_split)
-    flight_ids_train = flight_ids_with_fuel[:split_idx]
-    flight_ids_validation = flight_ids_with_fuel[split_idx:]
-    flight_ids_train = set(flight_ids_train)
-
     flight_id_to_flight: dict[FlightId, raw.FlightListRecord] = {
         row["flight_id"]: row  # type: ignore
         for row in flight_list_lf.collect().iter_rows(named=True)
@@ -263,8 +296,7 @@ def make_trajectories(
         for row in raw.scan_airports().collect().iter_rows(named=True)
     }  # type: ignore
 
-    trajectories_train: list[pl.LazyFrame] = []
-    trajectories_validation: list[pl.LazyFrame] = []
+    trajectories_all: list[pl.LazyFrame] = []
     for i, flight_id in enumerate(track(flight_ids_with_fuel, description="processing flights")):
         traj_lf = raw.scan_trajectory(flight_id, partition)
         flight = flight_id_to_flight[flight_id]
@@ -341,14 +373,20 @@ def make_trajectories(
         vs_raw = fpm2mps(full_traj_df["vertical_rate"].to_numpy())
         alt_raw = ft2m(full_traj_df["altitude"].to_numpy())
         gs_raw = knot2mps(full_traj_df["groundspeed"].to_numpy())
+        track_raw_rad = np.deg2rad(full_traj_df["track"].to_numpy())
 
         vs_outlier_mask = (np.abs(vs_raw) > vertical_speed_max) | np.isnan(vs_raw)
         alt_outlier_mask = (alt_raw > altitude_max) | np.isnan(alt_raw)
         gs_outlier_mask = (gs_raw > speed_max) | np.isnan(gs_raw)
+        track_outlier_mask = np.isnan(track_raw_rad)
 
         vs_with_nan = np.where(vs_outlier_mask, np.nan, vs_raw)
         alt_with_nan = np.where(alt_outlier_mask, np.nan, alt_raw)
-        gs_with_nan = np.where(gs_outlier_mask, np.nan, gs_raw)
+
+        v_east_raw = gs_raw * np.sin(track_raw_rad)
+        v_north_raw = gs_raw * np.cos(track_raw_rad)
+        v_east_with_nan = np.where(gs_outlier_mask | track_outlier_mask, np.nan, v_east_raw)
+        v_north_with_nan = np.where(gs_outlier_mask | track_outlier_mask, np.nan, v_north_raw)
 
         dts_s = np.diff(timestamp_s)
         alt_res = smooth_time_series(
@@ -363,29 +401,52 @@ def make_trajectories(
             process_noise_variances=(0.3**2, 0.1**2),
             observation_noise_variance=1.0**2,
         )
-        gs_res = smooth_time_series(
-            values=gs_with_nan,
+        v_east_res = smooth_time_series(
+            values=v_east_with_nan,
+            dts_s=dts_s,
+            process_noise_variances=(1.0**2, 0.1**2),
+            observation_noise_variance=6.0**2,
+        )
+        v_north_res = smooth_time_series(
+            values=v_north_with_nan,
             dts_s=dts_s,
             process_noise_variances=(1.0**2, 0.1**2),
             observation_noise_variance=6.0**2,
         )
 
+        v_east_smooth, v_east_dot_smooth = v_east_res.val, v_east_res.val_d
+        v_north_smooth, v_north_dot_smooth = v_north_res.val, v_north_res.val_d
+        gs_smooth = np.sqrt(v_east_smooth**2 + v_north_smooth**2)
+        gs_smooth_outlier_mask = (gs_smooth > speed_max) | (gs_smooth < 0.0)
+        track_rate_smooth = np.abs(
+            (v_north_smooth * v_east_dot_smooth - v_east_smooth * v_north_dot_smooth)
+            / np.clip(v_east_smooth**2 + v_north_smooth**2, 1e-6, None)
+        )
+        track_rate_outlier_mask = track_rate_smooth > track_rate_max
+        gs_track_outlier_mask = gs_smooth_outlier_mask | track_rate_outlier_mask
+        # if ground speed or track rate fucked up, altitude is probably fucked as well
+        gs_smooth[gs_track_outlier_mask] = np.nan
+        track_rate_smooth[gs_track_outlier_mask] = np.nan
+
         if i < 100 or (plot_every_n_flights is not None and i % plot_every_n_flights == 0):
+            # import matplotlib
             import matplotlib.pyplot as plt
             from matplotlib.gridspec import GridSpec
 
+            # matplotlib.use("WebAgg")
             from .. import PATH_PLOTS_OUTPUT
 
-            N_PLOTS = 3
-            fig = plt.figure(figsize=(9, 9 * N_PLOTS * 0.75), layout="tight")
+            N_PLOTS = 4
+            fig = plt.figure(figsize=(9, 9 * N_PLOTS * 0.3), layout="tight")
             gs = GridSpec(N_PLOTS, 1, figure=fig)
 
             ax_alt = fig.add_subplot(gs[0])
             ax_vs = fig.add_subplot(gs[1], sharex=ax_alt)
             ax_gs = fig.add_subplot(gs[2], sharex=ax_alt)
+            ax_track = fig.add_subplot(gs[3], sharex=ax_alt)
 
-            for ax in [ax_alt, ax_vs, ax_gs]:
-                if ax != ax_gs:
+            for ax in [ax_alt, ax_vs, ax_gs, ax_track]:
+                if ax != ax_track:
                     plt.setp(ax.get_xticklabels(), visible=False)
                 ax.axvline(timestamp_takeoff.timestamp(), color="green", linewidth=0.5)
                 ax.axvline(timestamp_landed.timestamp(), color="blue", linewidth=0.5)
@@ -443,26 +504,38 @@ def make_trajectories(
             ax_gs.plot(timestamp_s, gs_raw, "k.", markersize=2, alpha=0.3, label="raw groundspeed")
             ax_gs.plot(
                 timestamp_s,
-                gs_res.val,
+                gs_smooth,
                 "r-",
                 linewidth=0.5,
                 label="smoothed groundspeed",
-            )
-            gs_std = np.sqrt(gs_res.var_val)
-            ax_gs.fill_between(
-                timestamp_s,
-                gs_res.val - gs_std,
-                gs_res.val + gs_std,
-                color="r",
-                alpha=0.2,
-                label=r"$\pm 1 \sigma$",
             )
             ax_gs.set_ylabel("groundspeed (m/s)")
             ax_gs.set_ylim(0, speed_max)
             ax_gs.legend()
 
-            ax_gs.set_xlabel("time (s)")
+            track_smooth_rad = np.arctan2(v_east_smooth, v_north_smooth)
+            track_smooth_deg = np.rad2deg(track_smooth_rad)
+            track_smooth_deg[track_smooth_deg < 0] += 360
+            ax_track.plot(
+                timestamp_s, track_smooth_deg, "r.", markersize=0.5, label="smoothed track"
+            )
+            ax_track.set_ylabel("track (deg)")
+            ax_track.set_ylim(0, 360)
+            ax_track.legend(loc="upper left")
+            ax_track_rate = ax_track.twinx()
+            ax_track_rate.plot(
+                timestamp_s,
+                np.rad2deg(track_rate_smooth),
+                "b.",
+                markersize=2,
+                label="track rate",
+            )
+            ax_track_rate.set_ylabel("track rate (deg/s)", color="b")
+            ax_track_rate.tick_params(axis="y", labelcolor="b")
+            ax_track_rate.legend(loc="lower right")
+            ax_track_rate.set_ylim(-np.rad2deg(track_rate_max), np.rad2deg(track_rate_max))
 
+            ax_track.set_xlabel("time (s)")
             fig.suptitle(f"flight id: {flight_id}")
 
             # plt.show()
@@ -487,32 +560,29 @@ def make_trajectories(
                 "vertical_rate_is_outlier": (vs_outlier_mask | np.isnan(vs_res.val)),
                 "altitude": _np_interpolate(alt_res.val, timestamp_s),
                 "altitude_is_outlier": (alt_outlier_mask | np.isnan(alt_res.val)),
-                "groundspeed": _np_interpolate(gs_res.val, timestamp_s),
-                "groundspeed_is_outlier": (gs_outlier_mask | np.isnan(gs_res.val)),
+                "groundspeed": _np_interpolate(gs_smooth, timestamp_s),
+                "groundspeed_is_outlier": (
+                    gs_outlier_mask | gs_smooth_outlier_mask | np.isnan(gs_smooth)
+                ),
+                "track_rate": _np_interpolate(track_rate_smooth, timestamp_s),
+                "track_rate_is_outlier": (track_rate_outlier_mask | np.isnan(track_rate_smooth)),
             }
         ).with_columns(pl.lit(flight_id).alias("flight_id"))
 
-        if flight_id in flight_ids_train:
-            trajectories_train.append(processed_traj_df.lazy())
-        elif flight_id in flight_ids_validation:
-            trajectories_validation.append(processed_traj_df.lazy())
+        trajectories_all.append(processed_traj_df.lazy())
 
-    for split, trajectories in [
-        ("train", trajectories_train),
-        ("validation", trajectories_validation),
-    ]:
-        output_path = path_base / f"trajectories_{partition}_{split}.parquet"
-        stop_event = multiprocessing.Event()
-        monitor_process = multiprocessing.Process(
-            target=_monitor_file_size, args=(output_path, stop_event)
-        )
-        monitor_process.start()
-        try:
-            pl.concat(trajectories).sink_parquet(output_path)
-        finally:
-            stop_event.set()
-            monitor_process.join()
-        logger.info(f"wrote {split} state vectors to {output_path}")
+    output_path = path_base / f"trajectories_{partition}.parquet"
+    stop_event = multiprocessing.Event()
+    monitor_process = multiprocessing.Process(
+        target=_monitor_file_size, args=(output_path, stop_event)
+    )
+    monitor_process.start()
+    try:
+        pl.concat(trajectories_all).sink_parquet(output_path)
+    finally:
+        stop_event.set()
+        monitor_process.join()
+    logger.info(f"wrote state vectors to {output_path}")
 
 
 def _monitor_file_size(path: Path, stop_event: Event, *, dt: float = 0.2, name: str = "writing"):
@@ -553,8 +623,8 @@ def make_standardisation_stats(
     *,
     path_base: Path = PATH_PREPROCESSED,
 ):
-    train_traj_lf = pl.scan_parquet(path_base / f"trajectories_{partition}_train.parquet")
-    train_flight_ids = train_traj_lf.select("flight_id").unique().collect()["flight_id"].to_list()
+    splits = load_splits(partition, path_base=path_base)
+    train_flight_ids = splits["train"]
 
     if subset_fraction is not None:  # hack to avoid OOM
         n_flights = len(train_flight_ids)
@@ -563,7 +633,6 @@ def make_standardisation_stats(
 
     trajectory_iterator = TrajectoryIterator(
         partition=partition,
-        split="train",
         flight_ids=train_flight_ids,
         start_to_end_only=True,
     )
@@ -597,6 +666,13 @@ def make_standardisation_stats(
 #
 
 
+def load_splits(
+    partition: Partition, *, path_base: Path = PATH_PREPROCESSED
+) -> dict[Split, list[FlightId]]:
+    with open(path_base / f"splits_{partition}.json") as f:
+        return json.load(f)
+
+
 def load_standardisation_stats(
     partition: Partition, *, path_base: Path = PATH_PREPROCESSED
 ) -> Stats:
@@ -625,7 +701,6 @@ class TrajectoryIterator:
     def __init__(
         self,
         partition: Partition,
-        split: Split,
         *,
         flight_ids: Collection[FlightId] | None = None,
         segments_df: pl.DataFrame | None = None,
@@ -647,7 +722,7 @@ class TrajectoryIterator:
             )
 
         self.segment_infos: list[TrajectoryInfo] = segments_df.to_dicts()  # type: ignore
-        traj_lf = pl.scan_parquet(path_base / f"trajectories_{partition}_{split}.parquet")
+        traj_lf = pl.scan_parquet(path_base / f"trajectories_{partition}.parquet")
 
         if stats is not None:
             standardisation_exprs = [

@@ -373,12 +373,12 @@ def seq_len_cdf(partition: Partition = "phase1") -> None:
 
     segment_lengths = []
     for split in SPLITS:
-        traj_lf = pl.scan_parquet(PATH_PREPROCESSED / f"trajectories_{partition}_{split}.parquet")
-        flight_ids = traj_lf.select("flight_id").unique().collect()["flight_id"].to_list()
+        splits = preprocessed.load_splits(partition)
+        flight_ids = splits[split]
 
         for trajectory in track(
             preprocessed.TrajectoryIterator(
-                partition, split, flight_ids=flight_ids, start_to_end_only=True
+                partition, flight_ids=flight_ids, start_to_end_only=True
             ),
             description=f"collecting segment lengths for {split}",
         ):
@@ -414,12 +414,11 @@ def preprocessed_features_cdf(
     from prc25.datasets import preprocessed
     from prc25.datasets.preprocessed import TrajectoryIterator
 
-    traj_lf = pl.scan_parquet(PATH_PREPROCESSED / f"trajectories_{partition}_{split}.parquet")
-    flight_ids = traj_lf.select("flight_id").unique().collect()["flight_id"].to_list()
+    splits = preprocessed.load_splits(partition)
+    flight_ids = splits[split]
 
     iterator = TrajectoryIterator(
         partition=partition,
-        split=split,
         flight_ids=flight_ids,
         start_to_end_only=True,
     )
@@ -714,7 +713,7 @@ def predictions(
 
     segment_info_data = []
     trajectory_iterator = TrajectoryIterator(
-        partition=partition, split=split, flight_ids=flight_ids, start_to_end_only=True
+        partition=partition, flight_ids=flight_ids, start_to_end_only=True
     )
     for segment in track(trajectory_iterator, description="gathering segment metadata"):
         duration_s = (segment.info["end"] - segment.info["start"]).total_seconds()

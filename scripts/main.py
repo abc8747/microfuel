@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Literal, assert_never
+from typing import TYPE_CHECKING, Annotated, Literal, NamedTuple, assert_never, overload
 
 import typer
 from rich.logging import RichHandler
@@ -23,6 +23,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
+
+
+class EvalResult(NamedTuple):
+    rmse_rate: float
+    rmse_kg: float
+    df: pl.DataFrame
+
+
+class PredResult(NamedTuple):
+    df: pl.DataFrame
 
 
 @app.command()
@@ -52,6 +62,17 @@ def create_actype_enum(partition: Partition = "phase1"):
         source += f'    "{aircraft_type}",  # {count / total:.2%}\n'
     source += "]"
     print(source)
+
+
+@app.command()
+def create_splits(
+    partition: Partition,
+    train_split: float = 0.8,
+    seed: int = 13,
+):
+    from prc25.datasets.preprocessed import make_splits
+
+    make_splits(partition=partition, train_split=train_split, seed=seed)
 
 
 @app.command()
@@ -238,15 +259,18 @@ def train(
                 scaler.update()
 
                 if global_step > 0 and global_step % 25 == 0:
-                    rmse_rate_val, rmse_kg_val, _ = _run_evaluation(
-                        model, val_dataloader, device, progress, "validating"
+                    eval_result = _run_inference(
+                        model, val_dataloader, device, progress, "validating", is_eval=True
                     )
                     wandb.log(
-                        {"rmse_rate_val": rmse_rate_val, "rmse_kg_val": rmse_kg_val},
+                        {
+                            "rmse_rate_val": eval_result.rmse_rate,
+                            "rmse_kg_val": eval_result.rmse_kg,
+                        },
                         step=global_step,
                     )
-                    if rmse_kg_val < best_val_rmse:
-                        best_val_rmse = rmse_kg_val
+                    if eval_result.rmse_kg < best_val_rmse:
+                        best_val_rmse = eval_result.rmse_kg
                         checkpoint_path = (
                             exp_checkpoint_dir / f"step{global_step:05}_{best_val_rmse:.2f}.pt"
                         )
@@ -259,7 +283,7 @@ def train(
                         )
                         torch.save(checkpoint, checkpoint_path)
                         logger.info(
-                            f"wrote {checkpoint_path}: best {rmse_kg_val=:.2f} ({rmse_rate_val=:.4f})"
+                            f"wrote {checkpoint_path}: best {best_val_rmse=:.2f} ({eval_result.rmse_rate=:.4f})"
                         )
                     model.train()
 
@@ -306,18 +330,44 @@ def train(
         evaluate(best_checkpoint_path, partition, "validation", batch_size)
 
 
-def _run_evaluation(
+@overload
+def _run_inference(
     model: FuelBurnPredictor,
     dataloader: torch.utils.data.DataLoader,
     device: str,
     progress: Progress,
     description: str,
-) -> tuple[float, float, pl.DataFrame]:
+    *,
+    is_eval: Literal[True],
+) -> EvalResult: ...
+
+
+@overload
+def _run_inference(
+    model: FuelBurnPredictor,
+    dataloader: torch.utils.data.DataLoader,
+    device: str,
+    progress: Progress,
+    description: str,
+    *,
+    is_eval: Literal[False],
+) -> PredResult: ...
+
+
+def _run_inference(
+    model: FuelBurnPredictor,
+    dataloader: torch.utils.data.DataLoader,
+    device: str,
+    progress: Progress,
+    description: str,
+    *,
+    is_eval: bool,
+) -> EvalResult | PredResult:
     import polars as pl
     import torch
 
     model.eval()
-    all_preds, all_trues, all_segment_ids, all_durations = [], [], [], []
+    all_preds_rate, all_trues_rate, all_segment_ids, all_durations = [], [], [], []
 
     with torch.no_grad():
         task = progress.add_task(description, total=len(dataloader))
@@ -335,41 +385,53 @@ def _run_evaluation(
             ):
                 y_pred_log = model(x, cu_seqlens, aircraft_type_idx)
 
-            y_pred_orig = torch.expm1(y_pred_log)
-            y_true_orig = torch.expm1(y_log)
-
-            all_preds.append(y_pred_orig.cpu())
-            all_trues.append(y_true_orig.cpu())
+            y_pred_rate = torch.expm1(y_pred_log)
+            all_preds_rate.append(y_pred_rate.cpu())
             all_segment_ids.append(segment_ids)
             all_durations.append(durations)
+
+            if is_eval:
+                y_true_rate = torch.expm1(y_log)
+                all_trues_rate.append(y_true_rate.cpu())
+
             progress.update(task, advance=1)
         progress.remove_task(task)
 
-    preds_tensor = torch.cat(all_preds).flatten()
-    trues_tensor = torch.cat(all_trues).flatten()
+    preds_rate_tensor = torch.cat(all_preds_rate).flatten()
     segment_ids_tensor = torch.cat(all_segment_ids).flatten()
     durations_tensor = torch.cat(all_durations).flatten()
 
-    df = pl.DataFrame(
-        {
-            "segment_id": segment_ids_tensor.numpy(),
-            "duration_s": durations_tensor.numpy(),
-            "y_true_rate": trues_tensor.numpy(),
-            "y_pred_rate": preds_tensor.to(torch.float32).numpy(),
-        }
-    )
-    df = df.with_columns(
-        (pl.col("y_true_rate") * pl.col("duration_s")).alias("y_true_kg"),
-        (pl.col("y_pred_rate") * pl.col("duration_s")).alias("y_pred_kg"),
-    )
+    if is_eval:
+        trues_rate_tensor = torch.cat(all_trues_rate).flatten()
+        df = pl.DataFrame(
+            {
+                "segment_id": segment_ids_tensor.numpy(),
+                "duration_s": durations_tensor.numpy(),
+                "y_true_rate": trues_rate_tensor.numpy(),
+                "y_pred_rate": preds_rate_tensor.to(torch.float32).numpy(),
+            }
+        )
+        df = df.with_columns(
+            (pl.col("y_true_rate") * pl.col("duration_s")).alias("y_true_kg"),
+            (pl.col("y_pred_rate") * pl.col("duration_s")).alias("y_pred_kg"),
+        )
 
-    rmse_rate = torch.sqrt(torch.mean((preds_tensor - trues_tensor) ** 2)).item()
+        rmse_rate = torch.sqrt(torch.mean((preds_rate_tensor - trues_rate_tensor) ** 2)).item()
 
-    preds_kg = preds_tensor * durations_tensor
-    trues_kg = trues_tensor * durations_tensor
-    rmse_kg = torch.sqrt(torch.mean((preds_kg - trues_kg) ** 2)).item()
+        preds_kg = preds_rate_tensor * durations_tensor
+        trues_kg = trues_rate_tensor * durations_tensor
+        rmse_kg = torch.sqrt(torch.mean((preds_kg - trues_kg) ** 2)).item()
 
-    return rmse_rate, rmse_kg, df
+        return EvalResult(rmse_rate=rmse_rate, rmse_kg=rmse_kg, df=df)
+    else:
+        preds_kg_tensor = preds_rate_tensor * durations_tensor
+        df = pl.DataFrame(
+            {
+                "idx": segment_ids_tensor.numpy(),
+                "fuel_kg": preds_kg_tensor.to(torch.float32).numpy(),
+            }
+        )
+        return PredResult(df=df)
 
 
 @app.command()
@@ -378,11 +440,15 @@ def evaluate(
     partition: Partition = "phase1",
     split: Split = "validation",
     batch_size: int = 64,
+    *,
+    for_submission: bool = False,
 ):
+    import polars as pl
     import torch
     from rich.progress import Progress
     from torch.utils.data import DataLoader
 
+    from prc25.datasets import raw
     from prc25.hacks import fla_autotuner_remove_nb
 
     fla_autotuner_remove_nb()
@@ -399,20 +465,82 @@ def evaluate(
     model.load_state_dict(checkpoint.model_state_dict)
     model.to(device)
 
-    dataset = VarlenDataset(partition=partition, split=split)
+    dataset_split = None if for_submission else split
+    if for_submission and "rank" not in partition:
+        logger.warning(
+            f"generating submission for partition `{partition}` which is not a ranking partition!"
+        )
+
+    dataset = VarlenDataset(partition=partition, split=dataset_split)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
     with Progress() as progress:
-        rmse_rate, rmse_kg, df = _run_evaluation(
-            model, dataloader, device, progress, f"evaluating on {split} split"
-        )
+        if for_submission:
+            pred_result = _run_inference(
+                model, dataloader, device, progress, f"predicting on {partition=}", is_eval=False
+            )
+            df_preds = pred_result.df
+            df_template = (
+                raw.scan_fuel(partition).select("idx", "flight_id", "start", "end").collect()
+            )
+            df = df_template.join(df_preds, on="idx", how="left").with_columns(pl.col("fuel_kg"))
+            df = df.select("idx", "flight_id", "start", "end", "fuel_kg")
+        else:
+            eval_result = _run_inference(
+                model, dataloader, device, progress, f"evaluating on {split=}", is_eval=True
+            )
+            df = eval_result.df
+            logger.info(
+                f"final rmse on {split=}:"
+                f" rate={eval_result.rmse_rate:.4f} kg/s,"
+                f" total={eval_result.rmse_kg:.2f} kg"
+            )
 
     exp_name = checkpoint_path.parent.name
     PATH_PREDICTIONS.mkdir(exist_ok=True, parents=True)
-    output_path = PATH_PREDICTIONS / f"{exp_name}_{split}.parquet"
+
+    if for_submission:
+        output_path = PATH_PREDICTIONS / f"{exp_name}_{partition}_submission.parquet"
+    else:
+        output_path = PATH_PREDICTIONS / f"{exp_name}_{split}.parquet"
+
     df.write_parquet(output_path)
     logger.info(f"wrote predictions to {output_path}")
-    logger.info(f"final rmse on {split=}: rate={rmse_rate:.4f} kg/s, total={rmse_kg:.2f} kg")
+
+
+@app.command()
+def submit(
+    predictions_path: Annotated[
+        Path, typer.Argument(help="Path to the prediction parquet file generated by `evaluate`.")
+    ],
+    version: Annotated[int, typer.Option("--version", "-v", help="Submission version number.")],
+):
+    import os
+
+    import polars as pl
+
+    from prc25.datasets.raw import load_config, setup_mc_alias
+
+    df = pl.read_parquet(predictions_path)
+    config = load_config()
+    team_name = config.get("team_name")
+    final_filename = f"{team_name}_v{version}.parquet"
+
+    alias_name = "prc25"
+    bucket_name = f"prc-2025-{team_name}"
+
+    remote_path = f"{alias_name}/{bucket_name}/{final_filename}"
+    cmd = f"mc cp {predictions_path} {remote_path}"
+
+    print(df.head())
+    print(df.select("fuel_kg").describe())
+    if not typer.confirm(f"execute {cmd}?"):
+        raise typer.Exit()
+
+    setup_mc_alias(
+        config["bucket_access_key"], config["bucket_access_secret"], alias_name=alias_name
+    )
+    return os.system(cmd)
 
 
 if __name__ == "__main__":

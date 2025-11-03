@@ -4,12 +4,11 @@ import logging
 from collections import namedtuple
 
 import numpy as np
-import polars as pl
 import torch
 from rich.progress import track
 from torch.utils.data import Dataset
 
-from . import AIRCRAFT_TYPES, PATH_PREPROCESSED, Partition, Split
+from . import AIRCRAFT_TYPES, Partition, Split
 from .datasets import preprocessed
 from .datasets.preprocessed import TrajectoryIterator, load_standardisation_stats
 
@@ -25,10 +24,24 @@ VarlenBatch = namedtuple(
 
 
 class VarlenDataset(Dataset):
-    def __init__(self, partition: Partition, split: Split):
-        traj_lf = pl.scan_parquet(PATH_PREPROCESSED / f"trajectories_{partition}_{split}.parquet")
-        flight_ids = traj_lf.select("flight_id").unique().collect()["flight_id"].to_list()
-        self.stats = load_standardisation_stats(partition)
+    def __init__(self, partition: Partition, split: Split | None):
+        if split:
+            splits = preprocessed.load_splits(partition)
+            flight_ids = splits[split]
+        else:
+            from .datasets import raw
+
+            flight_ids = (
+                raw.scan_fuel(partition)
+                .select("flight_id")
+                .unique()
+                .collect()["flight_id"]
+                .to_list()
+            )
+
+        # always get train stats for submission
+        stats_partition: Partition = partition.removesuffix("_rank")  # type: ignore
+        self.stats = load_standardisation_stats(stats_partition)
 
         self.ac_type_vocab = {ac_type: i for i, ac_type in enumerate(AIRCRAFT_TYPES)}
         self.ac_type_vocab["UNK"] = len(self.ac_type_vocab)
@@ -37,7 +50,6 @@ class VarlenDataset(Dataset):
 
         trajectory_iterator = TrajectoryIterator(
             partition=partition,
-            split=split,
             flight_ids=flight_ids,
             stats=self.stats,
             start_to_end_only=True,
@@ -46,7 +58,7 @@ class VarlenDataset(Dataset):
         self.sequences: list[Sequence] = []
         for trajectory in track(
             trajectory_iterator,
-            description=f"loading {split} data",
+            description=f"loading {split or partition} data",
             total=len(trajectory_iterator),
         ):
             if (height := trajectory.features_df.height) < 2:
@@ -64,7 +76,7 @@ class VarlenDataset(Dataset):
             )
 
             duration_s = (trajectory.info["end"] - trajectory.info["start"]).total_seconds()
-            target = np.log1p((trajectory.info["fuel_kg"] / duration_s))
+            target = np.log1p((trajectory.info["fuel_kg"] or np.nan / duration_s))
 
             ac_type_idx = self.ac_type_vocab.get(
                 trajectory.info["aircraft_type"], self.ac_type_vocab["UNK"]
