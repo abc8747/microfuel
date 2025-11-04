@@ -680,6 +680,40 @@ def load_standardisation_stats(
         return json.load(f)
 
 
+class IteratorData(NamedTuple):
+    segments_df: pl.DataFrame
+    traj_lf: pl.LazyFrame
+
+
+def prepare_iterator_data(
+    partition: Partition,
+    flight_ids: Collection[FlightId] | None = None,
+    stats: Stats | None = None,
+    path_base: Path = PATH_PREPROCESSED,
+) -> IteratorData:
+    """Prepares data required by the dataloader."""
+    fuel_lf = raw.scan_fuel(partition)
+    if flight_ids:
+        fuel_lf = fuel_lf.filter(pl.col("flight_id").is_in(flight_ids))
+
+    flight_list_lf = raw.scan_flight_list(partition)
+    segments_df = (
+        fuel_lf.join(flight_list_lf.select("flight_id", "takeoff", "aircraft_type"), on="flight_id")
+        .sort("flight_id")
+        .collect()
+    )
+
+    traj_lf = pl.scan_parquet(path_base / f"trajectories_{partition}.parquet")
+
+    if stats is not None:
+        standardisation_exprs = [
+            ((pl.col(f) - stats[f]["mean"]) / stats[f]["std"]).alias(f) for f in TRAJECTORY_FEATURES
+        ]
+        traj_lf = traj_lf.with_columns(standardisation_exprs)
+
+    return IteratorData(segments_df=segments_df, traj_lf=traj_lf)
+
+
 class TrajectoryInfo(TypedDict):
     idx: int
     flight_id: str
@@ -696,71 +730,64 @@ class Trajectory(NamedTuple):
 
 
 class TrajectoryIterator:
-    """Yields the entire flight trajectory for each segment."""
+    """Yields the entire flight trajectory for each segment as polars DataFrames.
+
+    Note: this materialises the trajectory for every single flight, beware of memory usage!
+    """
 
     def __init__(
         self,
         partition: Partition,
         *,
         flight_ids: Collection[FlightId] | None = None,
-        segments_df: pl.DataFrame | None = None,
         shuffle_seed: int | None = None,
         stats: Stats | None = None,
         start_to_end_only: bool = False,
         path_base: Path = PATH_PREPROCESSED,
     ):
-        if segments_df is None:
-            assert flight_ids is not None, "either `flight_ids` or `segments_df` must be provided"
-            fuel_lf = raw.scan_fuel(partition)
-            flight_list_lf = raw.scan_flight_list(partition)
-            segments_df = (
-                fuel_lf.filter(pl.col("flight_id").is_in(flight_ids))
-                .join(
-                    flight_list_lf.select("flight_id", "takeoff", "aircraft_type"), on="flight_id"
-                )
-                .collect()
-            )
-
-        self.segment_infos: list[TrajectoryInfo] = segments_df.to_dicts()  # type: ignore
-        traj_lf = pl.scan_parquet(path_base / f"trajectories_{partition}.parquet")
-
-        if stats is not None:
-            standardisation_exprs = [
-                ((pl.col(f) - stats[f]["mean"]) / stats[f]["std"]).alias(f)
-                for f in TRAJECTORY_FEATURES
-            ]
-            traj_lf = traj_lf.with_columns(standardisation_exprs)
-
-        all_flight_ids = list({info["flight_id"] for info in self.segment_infos})
-        all_trajs_df = traj_lf.filter(pl.col("flight_id").is_in(all_flight_ids)).collect()
-        self.traj_cache: dict[FlightId, pl.DataFrame] = {
-            flight_id: df for (flight_id,), df in all_trajs_df.group_by("flight_id")
-        }
-
-        self.shuffle_seed = shuffle_seed
+        it_data = prepare_iterator_data(partition, flight_ids, stats, path_base)
+        self.traj_lf = it_data.traj_lf
+        self.segment_infos: list[TrajectoryInfo] = it_data.segments_df.to_dicts()  # type: ignore
         self.start_to_end_only = start_to_end_only
+        self.stats = stats
+
+        self.segments_by_flight: dict[FlightId, list[TrajectoryInfo]] = {}
+        for info in self.segment_infos:
+            self.segments_by_flight.setdefault(info["flight_id"], []).append(info)
+
+        self.flight_ids_to_iterate = list(self.segments_by_flight.keys())
+        if shuffle_seed is not None:
+            rng = np.random.default_rng(shuffle_seed)
+            rng.shuffle(self.flight_ids_to_iterate)
 
     def __len__(self) -> int:
         return len(self.segment_infos)
 
     def __iter__(self) -> Iterator[Trajectory]:
-        indices = np.arange(len(self.segment_infos))
-        if self.shuffle_seed is not None:
-            rng = np.random.default_rng(self.shuffle_seed)
-            rng.shuffle(indices)
+        for flight_id in self.flight_ids_to_iterate:
+            flight_traj_df = self.traj_lf.filter(pl.col("flight_id") == flight_id).collect()
 
-        for idx in indices:
-            segment_info = self.segment_infos[idx]
-            flight_id = segment_info["flight_id"]
-            flight_traj_df = self.traj_cache[flight_id]
-            if self.start_to_end_only:
-                flight_traj_df = flight_traj_df.filter(
-                    pl.col("timestamp").is_between(
-                        segment_info["start"], segment_info["end"], closed="both"
+            for segment_info in self.segments_by_flight[flight_id]:
+                if self.start_to_end_only:
+                    start_relative = (
+                        segment_info["start"] - segment_info["takeoff"]
+                    ).total_seconds()
+                    end_relative = (segment_info["end"] - segment_info["takeoff"]).total_seconds()
+
+                    if self.stats:
+                        tst_stats = self.stats["time_since_takeoff"]
+                        start_relative = (start_relative - tst_stats["mean"]) / tst_stats["std"]
+                        end_relative = (end_relative - tst_stats["mean"]) / tst_stats["std"]
+
+                    segment_traj_df = flight_traj_df.filter(
+                        pl.col("time_since_takeoff").is_between(
+                            start_relative, end_relative, closed="both"
+                        )
                     )
-                )
+                else:
+                    segment_traj_df = flight_traj_df
 
-            yield Trajectory(
-                features_df=flight_traj_df,
-                info=segment_info,
-            )
+                yield Trajectory(
+                    features_df=segment_traj_df,
+                    info=segment_info,
+                )

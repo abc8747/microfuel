@@ -68,7 +68,7 @@ def create_actype_enum(partition: Partition = "phase1"):
 def create_splits(
     partition: Partition,
     train_split: float = 0.8,
-    seed: int = 13,
+    seed: int = 25,
 ):
     from prc25.datasets.preprocessed import make_splits
 
@@ -118,7 +118,7 @@ class Checkpoint:
 def train(
     partition: Partition = "phase1",
     batch_size: int = 64,
-    epochs: int = 15,
+    epochs: int = 10,
     lr: float = 3e-4,
     hidden_size: int = 32,
     num_heads: int = 2,
@@ -126,11 +126,11 @@ def train(
     aircraft_embedding_dim: int = 8,
     *,
     project_name: str = "prc25-multiac",
-    exp_name: str = "gdn-all_ac-v0.0.4+1layer+noduration",
+    exp_name: str = "gdn-all_ac-v0.0.5",
     resume_from: Annotated[
         Path | None, typer.Option(help="Path to checkpoint to resume training from.")
     ] = None,
-    loss_type: Literal["rmse_rate", "rmse_kg"] = "rmse_rate",
+    loss_type: Literal["rmse_rate", "rmse_kg", "rmse_kg2"] = "rmse_kg",
     evaluate_best: Annotated[
         bool, typer.Option(help="Evaluate the best model on the validation set after training.")
     ] = True,
@@ -156,6 +156,7 @@ def train(
     from prc25.datasets import preprocessed
     from prc25.model import FuelBurnPredictor, FuelBurnPredictorConfig
 
+    # NOTE: loading this takes 16GB of RAM on start, but drops to ~4GB
     train_dataset = VarlenDataset(partition=partition, split="train")
     train_dataloader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn
@@ -251,6 +252,8 @@ def train(
                         loss = criterion(y_pred_log, y_log).mean()
                     elif loss_type == "rmse_kg":
                         loss = (criterion(y_pred_log, y_log) * durations.unsqueeze(1)).mean()
+                    elif loss_type == "rmse_kg2":  # very unstable!
+                        loss = (criterion(y_pred_log, y_log) * durations.unsqueeze(1) ** 2).mean()
                     else:
                         assert_never(loss_type)
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import matplotlib.pyplot as plt
 import networkx as nx
@@ -14,7 +14,7 @@ from rich.logging import RichHandler
 from rich.progress import track
 
 import prc25.plot as p
-from prc25 import AIRCRAFT_TYPES, PATH_PLOTS_OUTPUT, PATH_PREPROCESSED, Partition, Split
+from prc25 import AIRCRAFT_TYPES, PATH_PLOTS_OUTPUT, Partition, Split
 from prc25.datasets import raw
 
 if TYPE_CHECKING:
@@ -366,38 +366,96 @@ def time_gap_cdf() -> None:
 #
 
 
-@app.command()
-def seq_len_cdf(partition: Partition = "phase1") -> None:
-    from prc25 import SPLITS
-    from prc25.datasets import preprocessed
+class SegmentStats(NamedTuple):
+    seq_lens: list[int]
+    durations: list[float]
 
-    segment_lengths = []
-    for split in SPLITS:
+
+def _get_seq_lens_and_durations(partition: Partition, split: Split | None = None) -> SegmentStats:
+    from rich.progress import track
+
+    from prc25.datasets import preprocessed, raw
+
+    if split:
         splits = preprocessed.load_splits(partition)
         flight_ids = splits[split]
+        description = f"collecting segment data for {partition}/{split}"
+    else:
+        flight_ids = (
+            raw.scan_fuel(partition).select("flight_id").unique().collect()["flight_id"].to_list()
+        )
+        description = f"collecting segment data for {partition}"
 
-        for trajectory in track(
-            preprocessed.TrajectoryIterator(
-                partition, flight_ids=flight_ids, start_to_end_only=True
-            ),
-            description=f"collecting segment lengths for {split}",
-        ):
-            segment_lengths.append(len(trajectory.features_df))
+    seq_lens = []
+    durations = []
+    iterator = preprocessed.TrajectoryIterator(
+        partition, flight_ids=flight_ids, start_to_end_only=True
+    )
+    for trajectory in track(iterator, description=description, total=len(iterator)):
+        seq_lens.append(len(trajectory.features_df))
+        duration_s = (trajectory.info["end"] - trajectory.info["start"]).total_seconds()
+        durations.append(duration_s)
+    return SegmentStats(seq_lens, durations)
 
-    fig = p.default_fig(figsize=(16, 8))
-    ax = fig.add_subplot(111)
-    _plot_cdf(ax, pl.Series(segment_lengths), "sequence length", "C0")
 
-    ax.set_xscale("log")
-    ax.set_ylim(0, 100)
-    ax.set_xlabel("Sequence Length")
-    ax.set_ylabel("Cumulative Frequency (%)")
-    ax.grid(True, which="both", linewidth=0.5)
-    ax.xaxis.set_major_formatter(ScalarFormatter())
-    ax.legend()
+@app.command()
+def segment_distributions() -> None:
+    import matplotlib.gridspec as gridspec
 
-    output_path = PATH_PLOTS_OUTPUT / "seq_len_cdf.pdf"
-    fig.savefig(output_path, bbox_inches="tight")
+    seq_lens_rank, durations_rank = _get_seq_lens_and_durations("phase1_rank")
+    seq_lens_train, durations_train = _get_seq_lens_and_durations("phase1", "train")
+    seq_lens_val, durations_val = _get_seq_lens_and_durations("phase1", "validation")
+    seq_lens_all = seq_lens_train + seq_lens_val
+    durations_all = durations_train + durations_val
+
+    fig = plt.figure(figsize=(16, 18))
+    gs = gridspec.GridSpec(3, 1, height_ratios=[1, 1, 1], hspace=0.4)
+
+    ax_seq_len_cdf = fig.add_subplot(gs[0])
+    ax_duration_cdf = fig.add_subplot(gs[1])
+    ax_scatter = fig.add_subplot(gs[2])
+
+    _plot_cdf(ax_seq_len_cdf, pl.Series(seq_lens_rank), "phase1_rank", "C0")
+    _plot_cdf(ax_seq_len_cdf, pl.Series(seq_lens_all), "phase1", "C1")
+    ax_seq_len_cdf.set_xscale("log")
+    ax_seq_len_cdf.set_ylim(0, 100)
+    ax_seq_len_cdf.set_xlabel("Segment Sequence Length")
+    ax_seq_len_cdf.set_ylabel("Cumulative Frequency (%)")
+    ax_seq_len_cdf.grid(True, which="both", linewidth=0.5)
+    ax_seq_len_cdf.xaxis.set_major_formatter(ScalarFormatter())
+    ax_seq_len_cdf.legend()
+
+    _plot_cdf(ax_duration_cdf, pl.Series(durations_rank), "phase1_rank", "C2")
+    _plot_cdf(ax_duration_cdf, pl.Series(durations_all), "phase1", "C3")
+    ax_duration_cdf.set_xscale("log")
+    ax_duration_cdf.set_ylim(0, 100)
+    ax_duration_cdf.set_xlabel("Segment Duration (s)")
+    ax_duration_cdf.set_ylabel("Cumulative Frequency (%)")
+    ax_duration_cdf.grid(True, which="both", linewidth=0.5)
+    ax_duration_cdf.xaxis.set_major_formatter(ScalarFormatter())
+    ax_duration_cdf.legend()
+
+    ax_scatter.scatter(
+        durations_rank,
+        seq_lens_rank,
+        s=0.5,
+        alpha=0.1,
+        label="phase1_rank",
+        color="C0",
+        linewidths=0,
+    )
+    ax_scatter.scatter(
+        durations_all, seq_lens_all, s=0.5, alpha=0.1, label="phase1", color="C1", linewidths=0
+    )
+    ax_scatter.set_xscale("log")
+    ax_scatter.set_yscale("log")
+    ax_scatter.set_xlabel("Segment Duration (s)")
+    ax_scatter.set_ylabel("Segment Sequence Length")
+    ax_scatter.grid(True, which="both", linewidth=0.5, alpha=0.3)
+    ax_scatter.legend()
+
+    output_path = PATH_PLOTS_OUTPUT / "segment_durations.png"
+    fig.savefig(output_path, bbox_inches="tight", dpi=300)
     plt.close(fig)
     logger.info(f"wrote plot to {output_path}")
 
@@ -639,8 +697,8 @@ def _plot_dist_cdf(ax: Axes, y_true: np.ndarray, y_pred: np.ndarray, *, unit: st
     sorted_pred = np.sort(y_pred)
     cdf_true = np.arange(1, len(sorted_true) + 1) / len(sorted_true) * 100
     cdf_pred = np.arange(1, len(sorted_pred) + 1) / len(sorted_pred) * 100
-    ax.plot(sorted_true, cdf_true, linewidth=2, label="Actual")
-    ax.plot(sorted_pred, cdf_pred, linewidth=2, label="Predicted")
+    ax.plot(sorted_true, cdf_true, lw=0.5, label="Actual")
+    ax.plot(sorted_pred, cdf_pred, lw=0.5, label="Predicted")
     ax.set_xlabel(f"Value ({unit})")
     ax.set_ylabel("Cumulative Frequency (%)")
     ax.set_ylim(0, 100)
@@ -674,7 +732,7 @@ def _plot_rmse_cdf_by_actype(ax: Axes, df: pl.DataFrame, error_col: str, *, unit
         errors = np.sort(row["errors"])
         cdf = np.arange(1, len(errors) + 1) / len(errors) * 100
 
-        ax.plot(errors, cdf, linewidth=2, label=f"{ac_type} (RMSE: {rmse:.4f}±{stderr_rmse:.4f})")
+        ax.plot(errors, cdf, lw=0.5, label=f"{ac_type} (RMSE: {rmse:.4f}±{stderr_rmse:.4f})")
 
     ax.set_xlabel(f"Absolute Error ({unit})")
     ax.set_ylabel("Cumulative Frequency (%)")
@@ -686,11 +744,7 @@ def _plot_rmse_cdf_by_actype(ax: Axes, df: pl.DataFrame, error_col: str, *, unit
 
 
 @app.command()
-def predictions(
-    predictions_path: Path,
-    partition: Partition = "phase1",
-    split: Split = "validation",
-):
+def predictions(predictions_path: Path, partition: Partition = "phase1"):
     import matplotlib.colors as mcolors
     import matplotlib.gridspec as gridspec
     import matplotlib.pyplot as plt
@@ -793,6 +847,152 @@ def predictions(
     fig.savefig(plot_path, bbox_inches="tight", dpi=300)
     plt.close(fig)
     logger.info(f"wrote prediction plot to {plot_path}")
+
+
+def runs_multi_predictions():
+    from prc25 import PATH_PREDICTIONS
+
+    for f in PATH_PREDICTIONS.glob("*.parquet"):
+        run_id = f.stem.removeprefix("gdn-all_ac-").removesuffix("_validation")
+        if not run_id.startswith("v0.0.5+kg+seed") or run_id.endswith("+5layer"):
+            continue
+        lf = pl.scan_parquet(f)
+        yield run_id, lf
+
+
+@app.command()
+def multi_predictions():
+    import matplotlib.gridspec as gridspec
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    from prc25.datasets import raw
+    from prc25.datasets.preprocessed import TrajectoryIterator
+
+    fig = plt.figure(figsize=(12, 24))
+    gs = gridspec.GridSpec(5, 1, height_ratios=[1, 1, 1, 1, 0.1], hspace=0.3)
+    ax1 = fig.add_subplot(gs[0])
+    ax2 = fig.add_subplot(gs[1])
+    ax3 = fig.add_subplot(gs[2])
+    ax4 = fig.add_subplot(gs[3])
+    legend_ax = fig.add_subplot(gs[4])
+    legend_ax.axis("off")
+
+    segment_id_to_seq_len = {}
+    all_flight_ids = set()
+
+    for run_id, lf in runs_multi_predictions():
+        flight_ids = (
+            lf.join(raw.scan_fuel("phase1"), left_on="segment_id", right_on="idx")
+            .select("flight_id")
+            .unique()
+            .collect()["flight_id"]
+            .to_list()
+        )
+        all_flight_ids.update(flight_ids)
+
+    trajectory_iterator = TrajectoryIterator(
+        partition="phase1", flight_ids=list(all_flight_ids), start_to_end_only=True
+    )
+    for segment in track(trajectory_iterator, description="collecting sequence lengths"):
+        segment_id_to_seq_len[segment.info["idx"]] = len(segment.features_df)
+
+    handles, labels = [], []
+    for run_id, lf in runs_multi_predictions():
+        df = lf.select(
+            pl.col("segment_id"),
+            pl.col("duration_s"),
+            ((pl.col("y_pred_kg") - pl.col("y_true_kg")) ** 2).alias("se"),
+        ).collect()
+
+        rmse = np.sqrt(np.mean(df["se"].to_numpy()))
+        label = f"{run_id} (RMSE: {rmse:.2f})"
+
+        sort_indices = np.argsort(df["duration_s"].to_numpy())
+        durations = df["duration_s"].to_numpy()[sort_indices]
+        squared_errors = df["se"].to_numpy()[sort_indices]
+
+        cum_durations = np.cumsum(durations)
+        cum_se = np.cumsum(squared_errors)
+
+        (line1,) = ax1.plot(cum_durations, cum_se, label=label, linewidth=1)
+
+        seq_lengths = [segment_id_to_seq_len[sid] for sid in df["segment_id"].to_list()]
+        squared_errors_all = df["se"].to_numpy()
+
+        sort_indices_seq = np.argsort(seq_lengths)
+        seq_lengths_sorted = np.array(seq_lengths)[sort_indices_seq]
+        squared_errors_sorted = squared_errors_all[sort_indices_seq]
+
+        cum_seq_len = np.cumsum(seq_lengths_sorted)
+        cum_se_seq = np.cumsum(squared_errors_sorted)
+
+        ax2.plot(cum_seq_len, cum_se_seq, label=label, lw=1, color=line1.get_color())
+
+        sorted_durations = np.sort(durations)
+        cdf_durations = np.arange(1, len(sorted_durations) + 1) / len(sorted_durations) * 100
+        ax3.plot(sorted_durations, cdf_durations, label=label, lw=1, color=line1.get_color())
+
+        sorted_seq_len = np.sort(seq_lengths_sorted)
+        cdf_seq_len = np.arange(1, len(sorted_seq_len) + 1) / len(sorted_seq_len) * 100
+        ax4.plot(sorted_seq_len, cdf_seq_len, label=label, lw=1, color=line1.get_color())
+
+        if len(handles) == 0 or run_id not in labels:
+            handles.append(line1)
+            labels.append(label)
+
+    seq_lens_rank, durations_rank = _get_seq_lens_and_durations("phase1_rank")
+    sorted_durations_rank = np.sort(durations_rank)
+    cdf_durations_rank = (
+        np.arange(1, len(sorted_durations_rank) + 1) / len(sorted_durations_rank) * 100
+    )
+    ax3.plot(
+        sorted_durations_rank,
+        cdf_durations_rank,
+        label="phase1_rank",
+        lw=1,
+        color="black",
+        linestyle="--",
+    )
+    sorted_seq_len_rank = np.sort(seq_lens_rank)
+    cdf_seq_len_rank = np.arange(1, len(sorted_seq_len_rank) + 1) / len(sorted_seq_len_rank) * 100
+    (line_rank,) = ax4.plot(
+        sorted_seq_len_rank,
+        cdf_seq_len_rank,
+        label="phase1_rank",
+        lw=1,
+        color="black",
+        linestyle="--",
+    )
+    handles.append(line_rank)
+    labels.append("phase1_rank")
+
+    ax1.set_xlabel("Cumulative Duration (s)")
+    ax1.set_ylabel("Cumulative Squared Error (kg²)")
+    ax1.grid(True, alpha=0.1, which="both")
+
+    ax2.set_xlabel("Cumulative Sequence Length")
+    ax2.set_ylabel("Cumulative Squared Error (kg²)")
+    ax2.set_xscale("log")
+    ax2.grid(True, alpha=0.1, which="both")
+
+    ax3.set_xlabel("Segment Duration (s)")
+    ax3.set_ylabel("Cumulative Frequency (%)")
+    ax3.set_ylim(0, 100)
+    ax3.grid(True, alpha=0.1, which="both")
+
+    ax4.set_xlabel("Sequence Length")
+    ax4.set_ylabel("Cumulative Frequency (%)")
+    ax4.set_ylim(0, 100)
+    ax4.set_xscale("log")
+    ax4.grid(True, alpha=0.1, which="both")
+
+    legend_ax.legend(handles, labels, loc="center", ncol=min(len(labels), 3))
+
+    path_out = PATH_PLOTS_OUTPUT / "multi_predictions.png"
+    fig.savefig(path_out, bbox_inches="tight", dpi=300)
+    plt.close(fig)
+    logger.info(f"wrote {path_out}")
 
 
 if __name__ == "__main__":

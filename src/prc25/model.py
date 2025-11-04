@@ -111,13 +111,20 @@ class FuelBurnPredictor(nn.Module):
         self.regression_head = nn.Linear(cfg.hidden_size, 1)
 
     def forward(
-        self, x: torch.Tensor, cu_seqlens: torch.Tensor, aircraft_type_idx: torch.Tensor
+        self,
+        x: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        aircraft_type_idx: torch.Tensor,
     ) -> torch.Tensor:
-        """:param x: Packed tensor
-        :param cu_seqlens: Cumulative sequence lengths for packed tensor"""
-        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        """:param x: Packed tensor of trajectory segments
+        :param cu_seqlens: Cumulative sequence lengths for packed tensor
+        :param aircraft_type_idx: (B,) tensor of aircraft type indices"""
+        # for now, we only operate on the [start, end] segments.
+        # this is a temporary step before using full flight context.
+        segment_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+
         ac_embeddings = self.aircraft_embedding(aircraft_type_idx)
-        ac_embeddings_repeated = torch.repeat_interleave(ac_embeddings, lengths, dim=0)
+        ac_embeddings_repeated = torch.repeat_interleave(ac_embeddings, segment_lengths, dim=0)
 
         x = torch.cat([x, ac_embeddings_repeated], dim=1)
         x = self.input_proj(x)
