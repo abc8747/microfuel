@@ -16,12 +16,40 @@ This problem structure allows for two inference paradigms. Given all observation
 
 ## Baseline (v0.0)
 
-For this sequence-to-scalar regression task, we use a simple **single layer** [Gated DeltaNet](https://arxiv.org/pdf/2412.06464) (GDN) as a baseline. The choice is motivated by several factors:
+For this sequence-to-scalar regression task, we use a simple **single layer** [Gated DeltaNet](https://arxiv.org/pdf/2412.06464) (GDN) as a baseline.
 
-- standard transformers are powerful but suffer from $O(L^2)$ complexity. GDN is a linear RNN belonging to the family of state space models (SSM) that offers near-linear complexity for both training and inference while approaching the expressivity of transformers.
-- LSTM struggle to capture long-range dependencies due to vanishing gradient. GDN is far more expressive:
-  - Delta Rule: allows model to make targeted corrections to its internal state with each new observation (effectively, fast weight programmer learning key-value associations from the flight history).
-  - Gating: controls how much of the past state is preserved at each step, allowing model to forget information.
+Standard transformers are powerful but suffer from $O(L^2)$ complexity. GDN belongs to the family of state space models (SSM) that offers near-linear complexity for both training and inference while approaching the expressivity of transformers.
+
+the recurrence is:
+$$
+S_t = \underbrace{\alpha_t (I - \beta_t k_t k_t^T)}_{\text{multiplicative/homogeneous part}} S_{t-1} + \underbrace{\beta_t v_t k_t^T}_{\text{additive/input part}}
+$$
+
+this is a discrete-time, time-varying bilinear system, with the memory matrix $S_t \in \mathbb{R}^{d_k \times d_v}$, vectorized as $\text{vec}(S_t)$.
+
+1. the multiplicative part:
+
+   - the term $(I - \beta_t k_t k_t^T)$ is a form of a Householder transformation. if $\|k_t\|_2 = 1$ and $\beta_t = 2$, it's a reflection (orthogonal, norm-preserving).
+   - $\beta_t$ is the output of a sigmoid, so $0 < \beta_t < 1$. assuming $k_t$ is normalized (see below), this matrix is a contraction. its eigenvalues are $1$ (with multiplicity $d_k - 1$) and $1 - \beta_t$ (with multiplicity 1). all are $\leq 1$.
+   - $\alpha_t$ is the decay gate, $\exp(g)$. $g$ is parameterized to be negative, so $0 < \alpha_t < 1$.
+   - therefore, the multiplicative operator $\alpha_t (I - \beta_t k_t k_t^T)$ is a contraction. repeated application to $S_{t-1}$ will decay its norm.
+
+2. the additive part:
+
+   - the state $S_t$ accumulates outer products $\beta_t v_t k_t^T$ at each step.
+   - unrolling the recurrence for a few steps:
+       $$
+       S_t \approx \sum_{i=1}^{t} \left( \prod_{j=i+1}^{t} M_j \right) N_i
+       $$
+       where $M_j$ is the multiplicative matrix and $N_i$ is the additive term.
+   - even though each $M_j$ is a contraction, we are summing $t$ terms. if the norms $\|N_i\|_F = \|\beta_t v_t k_t^T\|_F = \beta_t \|v_t\|_2 \|k_t\|_2$ are consistently large, the sum $\|S_t\|_F$ can grow linearly or faster, leading to explosion.
+
+we would like to log:
+
+- the frobenius norm of the intermediate states
+- mean values of $\alpha_t$ (`exp(g)`) and $\beta_t$
+
+but this is difficult without modifying the gateddeltanet. TODO: vendor it.
 
 ### Inputs & Feature Engineering
 
@@ -42,6 +70,7 @@ $$
 - $o_i$: Standardised observations from the preprocessed trajectory, including altitude, groundspeed, and vertical rate.
 - $\tau_{ii}$: Time since takeoff, $t_i - t_{\text{takeoff}}$, providing global temporal context.
 - $\tau_{if}$: Time till arrival, $t_\text{arrival} - t_i$
+- aircraft type: a categorical feature drawn from a long-tailed distribution
 
 Several other features were experimented with but did not improve performance, including time gaps between observations ($\Delta t_i$), `time2vec` embeddings, and physics-informed features like $\frac{T - D}{m} = \underbrace{\frac{dV}{dt} + g \frac{dh}{dt}}_{\text{Specific Energy Rate}} + \text{wind effect}$ and a $\frac{C_L S}{m} = \frac{g\cos\gamma}{\frac{1}{2}\rho V^2 \cos\phi}$. Noisy sequences are usually the culprit (e.g. $\dot{V}$, $\ddot{h}$)
 
@@ -68,7 +97,9 @@ The model is trained to minimize the RMSE of the total fuel burn in kilograms. T
 
 Finetuning with a loss function that directly weights by segment duration (`rmse_kg`) provides a slight improvement in the final metric.
 
-^ this refers to seed 13. k fold CV reveals values between 200-310.
+^ this incorrectly refers to seed 13 of train/validation split constructed from random sampling. more runs reveal RMSE of between 200-350.
+
+<!-- v0.0.6: introduced warmup and gradient clipping to stabilise training.  -->
 
 ## TODO
 
@@ -92,12 +123,11 @@ misc
 
 ### model
 
-- model has to compress everything, switch to mean pooling? increased convergence speed but had no effect on validation rmse.
-- bidirectional?
+- model has to compress everything, switch to mean pooling? increased convergence speed but worsened validation rmse.
+- bidirectional? no effect.
 - use `is_outlier` bool flags (check missingness first)
-- learning rate scheduling: warm up, hold at peak LR, then decay (cosine?)
-- stack more layers with residual connections and rmsnorm between (though preliminary tests yield negligible improvements, maybe revisit when we train on the entire flight where the model has to compress information)
+- stack more layers (though preliminary tests yield negligible improvements, maybe revisit when we train on the entire flight where the model has to compress information)
 - `fuel_burn` is quantised (see [data](./data.md)): also predict absolute uncertainty, but is this really needed? (gaussian_nll_loss probably isn't relevant)
 - staged training: train on short sequences first -> longer sequences
+- multilayer -> stochastic depth / layerscale
 - improve input projection.
-- gradient clipping

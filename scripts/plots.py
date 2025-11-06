@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING
 
 import matplotlib.pyplot as plt
 import networkx as nx
@@ -320,8 +320,8 @@ def _calculate_time_gaps(lf: pl.LazyFrame) -> pl.Series:
     )
 
 
-def _plot_cdf(ax: Axes, data: pl.Series, label: str, color: str) -> None:
-    sorted_data = np.sort(data.to_numpy())
+def _plot_cdf(ax: Axes, data: np.ndarray, label: str, color: str) -> None:
+    sorted_data = np.sort(data)
     cdf = np.arange(1, len(sorted_data) + 1) / len(sorted_data) * 100
     ax.plot(sorted_data, cdf, linestyle="-", label=label, color=color)
 
@@ -343,9 +343,9 @@ def time_gap_cdf() -> None:
     p._init_style()
     fig, ax = plt.subplots(1, 1, figsize=(16, 8))
 
-    _plot_cdf(ax, all_gaps, "time gaps (all)", "C0")
-    _plot_cdf(ax, acars_gaps, "time gaps (acars)", "C2")
-    _plot_cdf(ax, segment_lengths, "segment lengths (fuel data)", "C3")
+    _plot_cdf(ax, all_gaps.to_numpy(), "time gaps (all)", "C0")
+    _plot_cdf(ax, acars_gaps.to_numpy(), "time gaps (acars)", "C2")
+    _plot_cdf(ax, segment_lengths.to_numpy(), "segment lengths (fuel data)", "C3")
 
     ax.set_xscale("log")
     ax.set_ylim(0, 100)
@@ -366,57 +366,41 @@ def time_gap_cdf() -> None:
 #
 
 
-class SegmentStats(NamedTuple):
-    seq_lens: list[int]
-    durations: list[float]
+def _load_segment_info(partition: Partition) -> pl.LazyFrame:
+    from prc25 import PATH_PREPROCESSED
 
-
-def _get_seq_lens_and_durations(partition: Partition, split: Split | None = None) -> SegmentStats:
-    from rich.progress import track
-
-    from prc25.datasets import preprocessed, raw
-
-    if split:
-        splits = preprocessed.load_splits(partition)
-        flight_ids = splits[split]
-        description = f"collecting segment data for {partition}/{split}"
-    else:
-        flight_ids = (
-            raw.scan_fuel(partition).select("flight_id").unique().collect()["flight_id"].to_list()
+    fname = f"segment_info_{partition}.parquet"
+    path = PATH_PREPROCESSED / fname
+    if not path.exists():
+        raise FileNotFoundError(
+            f"expected segments stats file to be found at {path}.\nplease run `uv run "
+            f"scripts/main.py create-segment-info --partition {partition}` first."
         )
-        description = f"collecting segment data for {partition}"
-
-    seq_lens = []
-    durations = []
-    iterator = preprocessed.TrajectoryIterator(
-        partition, flight_ids=flight_ids, start_to_end_only=True
-    )
-    for trajectory in track(iterator, description=description, total=len(iterator)):
-        seq_lens.append(len(trajectory.features_df))
-        duration_s = (trajectory.info["end"] - trajectory.info["start"]).total_seconds()
-        durations.append(duration_s)
-    return SegmentStats(seq_lens, durations)
+    return pl.scan_parquet(path)
 
 
 @app.command()
 def segment_distributions() -> None:
     import matplotlib.gridspec as gridspec
+    import numpy as np
 
-    seq_lens_rank, durations_rank = _get_seq_lens_and_durations("phase1_rank")
-    seq_lens_train, durations_train = _get_seq_lens_and_durations("phase1", "train")
-    seq_lens_val, durations_val = _get_seq_lens_and_durations("phase1", "validation")
-    seq_lens_all = seq_lens_train + seq_lens_val
-    durations_all = durations_train + durations_val
+    df_rank = _load_segment_info("phase1_rank").collect()
+    seq_lens_rank = df_rank["seq_len"].to_numpy()
+    durations_rank = df_rank["duration_s"].to_numpy()
 
-    fig = plt.figure(figsize=(16, 18))
-    gs = gridspec.GridSpec(3, 1, height_ratios=[1, 1, 1], hspace=0.4)
+    df_all = _load_segment_info("phase1").collect()
+    seq_lens_all = df_all["seq_len"].to_numpy()
+    durations_all = df_all["duration_s"].to_numpy()
+
+    fig = plt.figure(figsize=(16, 20))
+    gs = gridspec.GridSpec(3, 1, height_ratios=[1, 1, 2])
 
     ax_seq_len_cdf = fig.add_subplot(gs[0])
     ax_duration_cdf = fig.add_subplot(gs[1])
-    ax_scatter = fig.add_subplot(gs[2])
+    ax_ac_dist = fig.add_subplot(gs[2])
 
-    _plot_cdf(ax_seq_len_cdf, pl.Series(seq_lens_rank), "phase1_rank", "C0")
-    _plot_cdf(ax_seq_len_cdf, pl.Series(seq_lens_all), "phase1", "C1")
+    _plot_cdf(ax_seq_len_cdf, seq_lens_rank, "phase1_rank", "C0")
+    _plot_cdf(ax_seq_len_cdf, seq_lens_all, "phase1", "C1")
     ax_seq_len_cdf.set_xscale("log")
     ax_seq_len_cdf.set_ylim(0, 100)
     ax_seq_len_cdf.set_xlabel("Segment Sequence Length")
@@ -425,8 +409,8 @@ def segment_distributions() -> None:
     ax_seq_len_cdf.xaxis.set_major_formatter(ScalarFormatter())
     ax_seq_len_cdf.legend()
 
-    _plot_cdf(ax_duration_cdf, pl.Series(durations_rank), "phase1_rank", "C2")
-    _plot_cdf(ax_duration_cdf, pl.Series(durations_all), "phase1", "C3")
+    _plot_cdf(ax_duration_cdf, durations_rank, "phase1_rank", "C0")
+    _plot_cdf(ax_duration_cdf, durations_all, "phase1", "C1")
     ax_duration_cdf.set_xscale("log")
     ax_duration_cdf.set_ylim(0, 100)
     ax_duration_cdf.set_xlabel("Segment Duration (s)")
@@ -435,26 +419,78 @@ def segment_distributions() -> None:
     ax_duration_cdf.xaxis.set_major_formatter(ScalarFormatter())
     ax_duration_cdf.legend()
 
-    ax_scatter.scatter(
-        durations_rank,
-        seq_lens_rank,
-        s=0.5,
-        alpha=0.1,
+    def get_ac_dist(df: pl.DataFrame) -> pl.DataFrame:
+        return (
+            df.group_by("aircraft_type")
+            .len()
+            .with_columns((pl.col("len") / pl.col("len").sum() * 100).alias("percentage"))
+            .sort("percentage", descending=True)
+        )
+
+    ac_dist_all = get_ac_dist(df_all)
+    ac_dist_rank = get_ac_dist(df_rank)
+
+    plot_data = (
+        ac_dist_all.select("aircraft_type")
+        .join(
+            ac_dist_all.select(
+                "aircraft_type",
+                pl.col("percentage").alias("phase1"),
+                pl.col("len").alias("phase1_count"),
+            ),
+            on="aircraft_type",
+            how="left",
+        )
+        .join(
+            ac_dist_rank.select(
+                "aircraft_type",
+                pl.col("percentage").alias("phase1_rank"),
+                pl.col("len").alias("phase1_rank_count"),
+            ),
+            on="aircraft_type",
+            how="left",
+        )
+        .fill_null(0)
+    )
+
+    ac_types = plot_data["aircraft_type"].to_list()
+    y = np.arange(len(ac_types))
+    bar_height = 0.4
+
+    bars1 = ax_ac_dist.barh(
+        y - bar_height / 2,
+        plot_data["phase1"],
+        height=bar_height,
+        label="phase1",
+        color="C1",
+    )
+    bars2 = ax_ac_dist.barh(
+        y + bar_height / 2,
+        plot_data["phase1_rank"],
+        height=bar_height,
         label="phase1_rank",
         color="C0",
-        linewidths=0,
     )
-    ax_scatter.scatter(
-        durations_all, seq_lens_all, s=0.5, alpha=0.1, label="phase1", color="C1", linewidths=0
+    ax_ac_dist.bar_label(
+        bars1, labels=plot_data["phase1_count"].cast(pl.Int64), padding=3, color="C1"
     )
-    ax_scatter.set_xscale("log")
-    ax_scatter.set_yscale("log")
-    ax_scatter.set_xlabel("Segment Duration (s)")
-    ax_scatter.set_ylabel("Segment Sequence Length")
-    ax_scatter.grid(True, which="both", linewidth=0.5, alpha=0.3)
-    ax_scatter.legend()
+    ax_ac_dist.bar_label(
+        bars2,
+        labels=plot_data["phase1_rank_count"].cast(pl.Int64),
+        padding=3,
+        color="C0",
+    )
 
-    output_path = PATH_PLOTS_OUTPUT / "segment_durations.png"
+    ax_ac_dist.set_ylabel("Aircraft Type")
+    ax_ac_dist.set_xlabel("Percentage of Segments (%)")
+    ax_ac_dist.set_title("Aircraft Type Distribution")
+    ax_ac_dist.set_yticks(y)
+    ax_ac_dist.set_yticklabels(ac_types)
+    ax_ac_dist.invert_yaxis()
+    ax_ac_dist.legend()
+    ax_ac_dist.grid(True, axis="x", alpha=0.3)
+
+    output_path = PATH_PLOTS_OUTPUT / "segment_distributions.png"
     fig.savefig(output_path, bbox_inches="tight", dpi=300)
     plt.close(fig)
     logger.info(f"wrote plot to {output_path}")
@@ -750,39 +786,11 @@ def predictions(predictions_path: Path, partition: Partition = "phase1"):
     import matplotlib.pyplot as plt
     import polars as pl
 
-    from prc25.datasets import raw
-    from prc25.datasets.preprocessed import TrajectoryIterator
-
     preds_df = pl.read_parquet(predictions_path)
 
-    fuel_lf = raw.scan_fuel(partition)
-    flight_ids = (
-        preds_df.lazy()
-        .join(fuel_lf, left_on="segment_id", right_on="idx")
-        .select("flight_id")
-        .unique()
-        .collect()["flight_id"]
-        .to_list()
-    )
+    segment_info_df = _load_segment_info(partition).collect()
 
-    segment_info_data = []
-    trajectory_iterator = TrajectoryIterator(
-        partition=partition, flight_ids=flight_ids, start_to_end_only=True
-    )
-    for segment in track(trajectory_iterator, description="gathering segment metadata"):
-        duration_s = (segment.info["end"] - segment.info["start"]).total_seconds()
-        seq_len = len(segment.features_df)
-        segment_info_data.append(
-            {
-                "idx": segment.info["idx"],
-                "duration_s": duration_s,
-                "seq_len": seq_len,
-                "aircraft_type": segment.info["aircraft_type"],
-            }
-        )
-    segment_info_df = pl.DataFrame(segment_info_data)
-
-    plot_df = preds_df.join(segment_info_df, left_on="segment_id", right_on="idx")
+    plot_df = preds_df.join(segment_info_df, on="segment_id")
 
     plot_df = plot_df.with_columns(
         (pl.col("y_pred_rate") - pl.col("y_true_rate")).abs().alias("mae_rate"),
@@ -854,7 +862,7 @@ def runs_multi_predictions():
 
     for f in PATH_PREDICTIONS.glob("*.parquet"):
         run_id = f.stem.removeprefix("gdn-all_ac-").removesuffix("_validation")
-        if not run_id.startswith("v0.0.5+kg+seed") or run_id.endswith("+5layer"):
+        if not run_id.startswith("v0.0.6+seed"):
             continue
         lf = pl.scan_parquet(f)
         yield run_id, lf
@@ -866,59 +874,52 @@ def multi_predictions():
     import matplotlib.pyplot as plt
     import numpy as np
 
-    from prc25.datasets import raw
-    from prc25.datasets.preprocessed import TrajectoryIterator
-
-    fig = plt.figure(figsize=(12, 24))
-    gs = gridspec.GridSpec(5, 1, height_ratios=[1, 1, 1, 1, 0.1], hspace=0.3)
+    fig = plt.figure(figsize=(12, 35))
+    gs = gridspec.GridSpec(7, 1, height_ratios=[1, 1, 1, 1, 2, 2, 0.4], hspace=0.3)
     ax1 = fig.add_subplot(gs[0])
     ax2 = fig.add_subplot(gs[1])
     ax3 = fig.add_subplot(gs[2])
     ax4 = fig.add_subplot(gs[3])
-    legend_ax = fig.add_subplot(gs[4])
+    ax_bar = fig.add_subplot(gs[4])
+    ax_rmse_vs_freq = fig.add_subplot(gs[5])
+    legend_ax = fig.add_subplot(gs[6])
     legend_ax.axis("off")
 
-    segment_id_to_seq_len = {}
-    all_flight_ids = set()
-
-    for run_id, lf in runs_multi_predictions():
-        flight_ids = (
-            lf.join(raw.scan_fuel("phase1"), left_on="segment_id", right_on="idx")
-            .select("flight_id")
-            .unique()
-            .collect()["flight_id"]
-            .to_list()
-        )
-        all_flight_ids.update(flight_ids)
-
-    trajectory_iterator = TrajectoryIterator(
-        partition="phase1", flight_ids=list(all_flight_ids), start_to_end_only=True
-    )
-    for segment in track(trajectory_iterator, description="collecting sequence lengths"):
-        segment_id_to_seq_len[segment.info["idx"]] = len(segment.features_df)
+    segment_info_df = _load_segment_info("phase1").collect()
+    segment_id_to_seq_len = {
+        row["segment_id"]: row["seq_len"] for row in segment_info_df.iter_rows(named=True)
+    }
 
     handles, labels = [], []
+    all_runs_dfs: list[pl.DataFrame] = []
     for run_id, lf in runs_multi_predictions():
-        df = lf.select(
-            pl.col("segment_id"),
-            pl.col("duration_s"),
-            ((pl.col("y_pred_kg") - pl.col("y_true_kg")) ** 2).alias("se"),
-        ).collect()
+        df_with_info = (
+            lf.join(segment_info_df.lazy(), on="segment_id", how="left")
+            .select(
+                pl.col("segment_id"),
+                pl.col("duration_s"),
+                ((pl.col("y_pred_kg") - pl.col("y_true_kg")) ** 2).alias("se"),
+                pl.col("aircraft_type"),
+                pl.col("seq_len"),
+            )
+            .collect()
+        )
+        all_runs_dfs.append(df_with_info.with_columns(pl.lit(run_id).alias("run_id")))
 
-        rmse = np.sqrt(np.mean(df["se"].to_numpy()))
+        rmse = np.sqrt(np.mean(df_with_info["se"].to_numpy()))
         label = f"{run_id} (RMSE: {rmse:.2f})"
 
-        sort_indices = np.argsort(df["duration_s"].to_numpy())
-        durations = df["duration_s"].to_numpy()[sort_indices]
-        squared_errors = df["se"].to_numpy()[sort_indices]
+        sort_indices = np.argsort(df_with_info["duration_s"].to_numpy())
+        durations = df_with_info["duration_s"].to_numpy()[sort_indices]
+        squared_errors = df_with_info["se"].to_numpy()[sort_indices]
 
         cum_durations = np.cumsum(durations)
         cum_se = np.cumsum(squared_errors)
 
         (line1,) = ax1.plot(cum_durations, cum_se, label=label, linewidth=1)
 
-        seq_lengths = [segment_id_to_seq_len[sid] for sid in df["segment_id"].to_list()]
-        squared_errors_all = df["se"].to_numpy()
+        seq_lengths = [segment_id_to_seq_len[sid] for sid in df_with_info["segment_id"].to_list()]
+        squared_errors_all = df_with_info["se"].to_numpy()
 
         sort_indices_seq = np.argsort(seq_lengths)
         seq_lengths_sorted = np.array(seq_lengths)[sort_indices_seq]
@@ -941,7 +942,10 @@ def multi_predictions():
             handles.append(line1)
             labels.append(label)
 
-    seq_lens_rank, durations_rank = _get_seq_lens_and_durations("phase1_rank")
+    df_rank = _load_segment_info("phase1_rank").collect()
+    seq_lens_rank = df_rank["seq_len"].to_numpy()
+    durations_rank = df_rank["duration_s"].to_numpy()
+
     sorted_durations_rank = np.sort(durations_rank)
     cdf_durations_rank = (
         np.arange(1, len(sorted_durations_rank) + 1) / len(sorted_durations_rank) * 100
@@ -966,6 +970,107 @@ def multi_predictions():
     )
     handles.append(line_rank)
     labels.append("phase1_rank")
+
+    all_runs_df = pl.concat(all_runs_dfs)
+    agg_df = all_runs_df.group_by("run_id", "aircraft_type").agg(
+        pl.sum("se").alias("sse"), pl.len().alias("count")
+    )
+    total_counts_by_run = agg_df.group_by("run_id").agg(pl.sum("count").alias("total_count"))
+    agg_df = agg_df.join(total_counts_by_run, on="run_id").with_columns(
+        (pl.col("count") / pl.col("total_count")).alias("percentage"),
+        (pl.col("sse") / pl.col("count")).sqrt().alias("rmse"),
+    )
+
+    def pivot_metric(df: pl.DataFrame, metric: str) -> pl.DataFrame:
+        return (
+            df.pivot(index="aircraft_type", on="run_id", values=metric)
+            .fill_null(0)
+            .with_columns(pl.col("aircraft_type").cast(pl.Enum(AIRCRAFT_TYPES)))
+            .sort("aircraft_type")
+        )
+
+    pivot_sse_df = pivot_metric(agg_df, "sse")
+    pivot_counts_df = pivot_metric(agg_df, "count")
+
+    ac_types_in_plot = sorted(agg_df["aircraft_type"].unique().to_list())
+    cmap_scatter = plt.get_cmap("tab20")
+    colors_scatter = cmap_scatter.colors
+    ac_color_map = {
+        ac: colors_scatter[i % len(colors_scatter)] for i, ac in enumerate(ac_types_in_plot)
+    }
+
+    run_ids_sorted = sorted([c for c in pivot_sse_df.columns if c != "aircraft_type"])
+    ac_types = pivot_sse_df["aircraft_type"].to_list()
+    x = np.arange(len(run_ids_sorted))
+    bottom = np.zeros(len(run_ids_sorted))
+
+    for ac_type in ac_types:
+        sse_values = (
+            pivot_sse_df.filter(pl.col("aircraft_type") == ac_type)
+            .select(run_ids_sorted)
+            .to_numpy()
+            .flatten()
+        )
+        count_values = (
+            pivot_counts_df.filter(pl.col("aircraft_type") == ac_type)
+            .select(run_ids_sorted)
+            .to_numpy()
+            .flatten()
+        )
+        color = ac_color_map[ac_type]
+        bars = ax_bar.bar(x, sse_values, bottom=bottom, label=ac_type, color=color)
+
+        for j, bar in enumerate(bars):
+            sse = sse_values[j]
+            count = count_values[j]
+            if sse > 0 and bar.get_height() / ax_bar.get_ylim()[1] > 0.015:
+                y_pos = bottom[j] + sse / 2
+                rgba_color = color
+                luminance = 0.299 * rgba_color[0] + 0.587 * rgba_color[1] + 0.114 * rgba_color[2]
+                text_color = "white" if luminance < 0.5 else "black"
+                ax_bar.text(
+                    x[j],
+                    y_pos,
+                    f"{ac_type}\n{int(count)}",
+                    ha="center",
+                    va="center",
+                    fontsize=4,
+                    color=text_color,
+                    fontweight="bold",
+                )
+        bottom += sse_values
+
+    ax_bar.set_xticks(x)
+    ax_bar.set_xticklabels(
+        [run_id.replace("v0.0.6+seed", "s") for run_id in run_ids_sorted],
+        rotation=45,
+        ha="right",
+    )
+    ax_bar.set_ylabel("Sum of Squared Errors (kg²)")
+    ax_bar.set_title("SSE Breakdown by Aircraft Type per Run")
+    ax_bar.grid(True, axis="y", alpha=0.3)
+
+    for (ac_type,), group_df in agg_df.sort("aircraft_type").group_by("aircraft_type"):
+        sse_vals = group_df["sse"].to_numpy()
+        freq_vals = group_df["percentage"].to_numpy()
+        ax_rmse_vs_freq.scatter(
+            freq_vals,
+            sse_vals,
+            label=ac_type,
+            color=ac_color_map.get(ac_type, "grey"),
+            alpha=0.7,
+            edgecolors="none",
+            s=50,
+        )
+
+    ax_rmse_vs_freq.set_xlabel("Frequency of aircraft type in run (fraction)")
+    ax_rmse_vs_freq.set_ylabel("Sum of Squared Errors (kg²)")
+    ax_rmse_vs_freq.set_title("SSE vs Frequency per Aircraft Type and Run")
+    ax_rmse_vs_freq.grid(True, which="both", alpha=0.3)
+    ax_rmse_vs_freq.legend(
+        title="Aircraft Type", bbox_to_anchor=(1.05, 1), loc="upper left", fontsize="small"
+    )
+    ax_rmse_vs_freq.set_xscale("log")
 
     ax1.set_xlabel("Cumulative Duration (s)")
     ax1.set_ylabel("Cumulative Squared Error (kg²)")
@@ -992,6 +1097,7 @@ def multi_predictions():
     path_out = PATH_PLOTS_OUTPUT / "multi_predictions.png"
     fig.savefig(path_out, bbox_inches="tight", dpi=300)
     plt.close(fig)
+
     logger.info(f"wrote {path_out}")
 
 

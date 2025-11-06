@@ -24,11 +24,12 @@ SequenceInfo = namedtuple(
         "segment_id",
         "aircraft_type_idx",
         "duration_s",
+        "flight_id",
     ],
 )
 Sequence = namedtuple(
     "Sequence",
-    ["features", "target", "segment_id", "aircraft_type_idx", "duration_s"],
+    ["features", "target", "segment_id", "aircraft_type_idx", "duration_s", "flight_id"],
 )
 VarlenBatch = namedtuple(
     "VarlenBatch",
@@ -109,11 +110,11 @@ class VarlenDataset(Dataset):
             start_relative_std = (start_relative - tst_mean) / tst_std
             end_relative_std = (end_relative - tst_mean) / tst_std
 
-            start_offset = torch.searchsorted(
-                time_since_takeoff_flight_std, start_relative_std, side="left"
-            )
-            end_offset = torch.searchsorted(
-                time_since_takeoff_flight_std, end_relative_std, side="right"
+            start_offset, end_offset = preprocessed.find_segment_indices(
+                time_since_takeoff_flight_std,
+                start_relative_std - 1e-9,
+                end_relative_std + 1e-9,
+                xp=torch,
             )
 
             if (end_offset - start_offset) < 2:
@@ -139,6 +140,7 @@ class VarlenDataset(Dataset):
                     segment_id=row["idx"],
                     aircraft_type_idx=ac_type_idx,
                     duration_s=duration_s,
+                    flight_id=row["flight_id"],
                 )
             )
 
@@ -158,6 +160,7 @@ class VarlenDataset(Dataset):
             segment_id=seq_info.segment_id,
             aircraft_type_idx=seq_info.aircraft_type_idx,
             duration_s=seq_info.duration_s,
+            flight_id=seq_info.flight_id,
         )
 
 

@@ -93,12 +93,51 @@ def create_stats(
     make_standardisation_stats(partition=partition)
 
 
+# NOTE: not used in training, purely for debugging in `./plots.py`.
+@app.command()
+def create_segment_info(partition: Partition):
+    import polars as pl
+    from rich.progress import track
+
+    from prc25 import PATH_PREPROCESSED
+    from prc25.datasets import preprocessed, raw
+
+    flight_ids = (
+        raw.scan_fuel(partition).select("flight_id").unique().collect()["flight_id"].to_list()
+    )
+    description = f"extracting segment info {partition}/all"
+
+    iterator = preprocessed.TrajectoryIterator(
+        partition, flight_ids=flight_ids, start_to_end_only=True
+    )
+
+    segment_stats_data = []
+    for trajectory in track(iterator, description=description, total=len(iterator)):
+        duration_s = (trajectory.info["end"] - trajectory.info["start"]).total_seconds()
+        segment_stats_data.append(
+            {
+                "segment_id": trajectory.info["idx"],
+                "flight_id": trajectory.info["flight_id"],
+                "aircraft_type": trajectory.info["aircraft_type"],
+                "seq_len": len(trajectory.features_df),
+                "duration_s": duration_s,
+            }
+        )
+
+    df = pl.DataFrame(segment_stats_data)
+    output_path = PATH_PREPROCESSED / f"segment_info_{partition}.parquet"
+    df.write_parquet(output_path)
+    logger.info(f"wrote segment stats to {output_path}")
+
+
 @dataclass
 class TrainConfig:
     partition: Partition
     batch_size: int
     epochs: int
     lr: float
+    weight_decay: float
+    warmup_steps: int
     seed: int
     model_config: FuelBurnPredictorConfig
     project_name: str
@@ -124,9 +163,10 @@ def train(
     num_heads: int = 2,
     num_layers: int = 1,
     aircraft_embedding_dim: int = 8,
+    pooler_mode: Literal["mean", "last"] = "last",
     *,
     project_name: str = "prc25-multiac",
-    exp_name: str = "gdn-all_ac-v0.0.5",
+    exp_name: str = "gdn-all_ac-v0.0.6+seed28",
     resume_from: Annotated[
         Path | None, typer.Option(help="Path to checkpoint to resume training from.")
     ] = None,
@@ -134,8 +174,12 @@ def train(
     evaluate_best: Annotated[
         bool, typer.Option(help="Evaluate the best model on the validation set after training.")
     ] = True,
+    weight_decay: float = 0.1,
+    warmup_steps: int = 250,
     seed: int = 13,
 ):
+    import math
+
     import torch
     from rich.progress import (
         BarColumn,
@@ -145,6 +189,7 @@ def train(
         TextColumn,
         TimeRemainingColumn,
     )
+    from torch.optim.lr_scheduler import LambdaLR
     from torch.utils.data import DataLoader
 
     from prc25.hacks import fla_autotuner_remove_nb
@@ -173,12 +218,15 @@ def train(
         num_aircraft_types=len(train_dataset.ac_type_vocab),
         aircraft_embedding_dim=aircraft_embedding_dim,
         num_layers=num_layers,
+        pooler_mode=pooler_mode,
     )
     cfg = TrainConfig(
         partition=partition,
         batch_size=batch_size,
         epochs=epochs,
         lr=lr,
+        weight_decay=weight_decay,
+        warmup_steps=warmup_steps,
         seed=seed,
         model_config=model_cfg,
         project_name=project_name,
@@ -200,11 +248,44 @@ def train(
     model = FuelBurnPredictor(cfg.model_config)
     total_params = sum(p.numel() for p in model.parameters())
     logger.info(f"model architecture ({total_params=:,}):")
-    for name, param in model.named_parameters():
-        logger.info(f"  {name:<25} {tuple(param.shape)!s:<15} {param.numel():,}")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
+    decay_params = []
+    no_decay_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if (
+            param.dim() < 2
+            or name.endswith(".bias")
+            or (hasattr(param, "_no_weight_decay") and param._no_weight_decay)  # type: ignore
+        ):
+            no_decay_params.append(param)
+            logger.info(f"  (no decay) {name:<27} {tuple(param.shape)!s:<15} {param.numel():,}")
+        else:
+            decay_params.append(param)
+            logger.info(f"  (decay)    {name:<27} {tuple(param.shape)!s:<15} {param.numel():,}")
+
+    optimizer_grouped_parameters = [
+        {"params": decay_params, "weight_decay": cfg.weight_decay},
+        {"params": no_decay_params, "weight_decay": 0.0},
+    ]
+    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=cfg.lr)
     criterion = torch.nn.MSELoss(reduction="none")
+
+    total_training_steps = len(train_dataloader) * cfg.epochs
+
+    def get_lr_scheduler(optimizer, warmup_steps, total_training_steps):
+        def lr_lambda(current_step):
+            if current_step < warmup_steps:
+                return float(current_step) / float(max(1, warmup_steps))
+            progress = float(current_step - warmup_steps) / float(
+                max(1, total_training_steps - warmup_steps)
+            )
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        return LambdaLR(optimizer, lr_lambda)
+
+    scheduler = get_lr_scheduler(optimizer, cfg.warmup_steps, total_training_steps)
 
     wandb.init(project=cfg.project_name, name=cfg.exp_name, config=asdict(cfg))
     wandb.watch(model, log="all", log_freq=100)
@@ -258,7 +339,10 @@ def train(
                         assert_never(loss_type)
 
                 scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
                 scaler.step(optimizer)
+                scheduler.step()
                 scaler.update()
 
                 if global_step > 0 and global_step % 25 == 0:
@@ -306,7 +390,12 @@ def train(
                     y_true_kg = y_true_rate_orig * durations.unsqueeze(1)
                     rmse_kg = torch.sqrt(torch.nn.functional.mse_loss(y_pred_kg, y_true_kg)).item()
                 wandb.log(
-                    {"rmse_rate_train": rmse_rate_orig, "rmse_kg_train": rmse_kg},
+                    {
+                        "lr": scheduler.get_last_lr()[0],
+                        "rmse_rate_train": rmse_rate_orig,
+                        "rmse_kg_train": rmse_kg,
+                        "gradient_norm": total_norm.item(),
+                    },
                     step=global_step,
                 )
 

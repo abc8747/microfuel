@@ -70,6 +70,7 @@ class FuelBurnPredictorConfig:
     num_aircraft_types: int
     aircraft_embedding_dim: int
     num_layers: int
+    pooler_mode: Literal["mean", "last"]
 
 
 class FuelBurnPredictor(nn.Module):
@@ -107,7 +108,7 @@ class FuelBurnPredictor(nn.Module):
                 for _ in range(cfg.num_layers)
             ]
         )
-        self.pooler = Pooler()
+        self.pooler = Pooler(mode=cfg.pooler_mode)
         self.regression_head = nn.Linear(cfg.hidden_size, 1)
 
     def forward(

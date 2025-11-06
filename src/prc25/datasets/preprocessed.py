@@ -78,6 +78,12 @@ def make_splits(
     logger.info(f"wrote splits to {output_path}")
 
 
+def find_segment_indices(timestamps, start_time, end_time, *, xp=np):
+    start_idx = xp.searchsorted(timestamps, start_time, side="left")
+    end_idx = xp.searchsorted(timestamps, end_time, side="right")
+    return start_idx, end_idx
+
+
 @nb.njit(cache=True)
 def _kalman_filter(
     measurements: np.ndarray,
@@ -730,10 +736,7 @@ class Trajectory(NamedTuple):
 
 
 class TrajectoryIterator:
-    """Yields the entire flight trajectory for each segment as polars DataFrames.
-
-    Note: this materialises the trajectory for every single flight, beware of memory usage!
-    """
+    """Yields the entire flight trajectory for each segment as polars DataFrames."""
 
     def __init__(
         self,
@@ -745,6 +748,11 @@ class TrajectoryIterator:
         start_to_end_only: bool = False,
         path_base: Path = PATH_PREPROCESSED,
     ):
+        """
+        :param start_to_end_only: if False, yields the entire materialised flight trajectory.
+            Note that collecting this iterator will use a lot of memory due to duplicates!
+            Prefer using the torch iterator instead.
+        """
         it_data = prepare_iterator_data(partition, flight_ids, stats, path_base)
         self.traj_lf = it_data.traj_lf
         self.segment_infos: list[TrajectoryInfo] = it_data.segments_df.to_dicts()  # type: ignore
@@ -773,17 +781,23 @@ class TrajectoryIterator:
                         segment_info["start"] - segment_info["takeoff"]
                     ).total_seconds()
                     end_relative = (segment_info["end"] - segment_info["takeoff"]).total_seconds()
+                    time_col_name = "time_since_takeoff"
 
                     if self.stats:
-                        tst_stats = self.stats["time_since_takeoff"]
+                        tst_stats = self.stats[time_col_name]
                         start_relative = (start_relative - tst_stats["mean"]) / tst_stats["std"]
                         end_relative = (end_relative - tst_stats["mean"]) / tst_stats["std"]
 
-                    segment_traj_df = flight_traj_df.filter(
-                        pl.col("time_since_takeoff").is_between(
-                            start_relative, end_relative, closed="both"
-                        )
+                    # endpoints can sometimes be located *just* beyond the window so be safe.
+                    start_idx, end_idx = find_segment_indices(
+                        flight_traj_df[time_col_name], start_relative - 1e-9, end_relative + 1e-9
                     )
+                    segment_traj_df = flight_traj_df[start_idx:end_idx]
+                    if segment_traj_df.height < 2:
+                        logger.error(
+                            f"skipping {flight_id}: found < 2 datapoints for segment "
+                            f"({start_relative} - {end_relative}): {start_idx}..={end_idx}"
+                        )
                 else:
                     segment_traj_df = flight_traj_df
 
