@@ -88,10 +88,15 @@ The model is trained to minimize the RMSE of the total fuel burn in kilograms. T
 
 <!-- assuming point mass, quasisteady flight, coordinated turn / no sideslip (also: $V = V_\text{gs}$, $\phi = 0$, no wind effect -->
 
-| Model Configuration            | Validation RMSE (kg) | Test RMSE (kg) |
-| ------------------------------ | -------------------- | -------------- |
-| v0.0.5 (baseline)              | 216.28^              | 247.15 (v1)    |
-| v0.0.5 + finetuned on RMSE(kg) | 209.92^              | 245.56 (v0)    |
+| Model Configuration            | Validation RMSE (kg) | Test RMSE (kg)    |
+| ------------------------------ | -------------------- | ----------------- |
+| v0.0.5 (baseline)              | 216.28^              | 247.15 (v1)       |
+| v0.0.5 + finetuned on RMSE(kg) | 209.92^              | 245.56 (v0)       |
+| v0.0.9+dev1+seed19             | 218.98               | 248.4382 (v3)     |
+| v0.0.9+dev1+seed21             | 222.84               | 253.5334 (v6)     |
+| v0.0.9+dev1+seed22             | 229.15               | 263.9342 (v5)     |
+| v0.0.9+dev1+seed24             | 208.58               | 267.9191 (v2, v4) |
+| v0.0.9+dev1+seed28             | 197.27               | 256.3522 (v7)     |
 
 Finetuning with a loss function that directly weights by segment duration (`rmse_kg`) provides a slight improvement in the final metric.
 

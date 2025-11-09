@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import matplotlib.pyplot as plt
-import networkx as nx
 import numpy as np
 import polars as pl
 import typer
@@ -824,7 +823,7 @@ def _plot_rmse_cdf_by_actype(ax: Axes, df: pl.DataFrame, error_col: str, *, unit
         .agg(
             pl.col(error_col).alias("errors"),
             pl.mean("se").sqrt().alias("rmse"),
-            pl.std("se").alias("std_se"),
+            pl.std("se").alias("std_se").fill_null(1),
             pl.len().alias("n"),
         )
         .sort("aircraft_type")
@@ -931,10 +930,12 @@ def runs_multi_predictions():
 
     for f in PATH_PREDICTIONS.glob("*.parquet"):
         run_id = f.stem.removeprefix("gdn-all_ac-").removesuffix("_validation")
-        if not run_id.startswith("v0.0.8+seed") or not run_id.endswith("+cb0.99"):
+        pre = "v0.0.9+seed"
+        suf = "+cb0.99+dev1"
+        if not run_id.startswith(pre) or not run_id.endswith(suf):
             continue
         lf = pl.scan_parquet(f)
-        yield run_id, lf
+        yield run_id.removeprefix(pre).removesuffix(suf), lf
 
 
 @app.command()

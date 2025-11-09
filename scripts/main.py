@@ -170,7 +170,7 @@ def train(
     ] = 0.99,
     *,
     project_name: str = "prc25-multiac",
-    exp_name: str = "gdn-all_ac-v0.0.8+?",
+    exp_name: str = "gdn-all_ac-v0.0.9",
     resume_from: Annotated[
         Path | None, typer.Option(help="Path to checkpoint to resume training from.")
     ] = None,
