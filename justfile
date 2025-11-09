@@ -9,8 +9,8 @@ train:
     #!/usr/bin/env bash
     for seed in 19; do
         uv run scripts/main.py create-splits phase1 --seed $seed
-        for beta in 0.9 0.999; do
-            # uv run scripts/main.py evaluate data/checkpoints/gdn-all_ac-v0.0.9+seed${seed}+cb${beta}+dev1/best.pt
-            uv run scripts/main.py train --exp-name gdn-all_ac-v0.0.9+seed${seed}+cb${beta}+dev1 --beta ${beta}
+        for beta in 0.99; do
+            # uv run scripts/main.py evaluate data/checkpoints/gdn-all_ac-v0.0.11+seed${seed}+cb${beta}+dev1/best.pt
+            uv run scripts/main.py train --exp-name gdn-all_ac-v0.0.12+seed${seed}+cb${beta}+dev1 --beta ${beta}
         done
     done

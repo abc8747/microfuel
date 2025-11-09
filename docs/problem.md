@@ -97,6 +97,9 @@ The model is trained to minimize the RMSE of the total fuel burn in kilograms. T
 | v0.0.9+dev1+seed22             | 229.15               | 263.9342 (v5)     |
 | v0.0.9+dev1+seed24             | 208.58               | 267.9191 (v2, v4) |
 | v0.0.9+dev1+seed28             | 197.27               | 256.3522 (v7)     |
+| v0.0.10+dev1+seed19            | 221.46               | 238.9257 (v8)     |
+| v0.0.11+dev1+seed19 (2 layers) | 220.65               | 248.8969 (v9)     |
+
 
 Finetuning with a loss function that directly weights by segment duration (`rmse_kg`) provides a slight improvement in the final metric.
 
@@ -108,6 +111,7 @@ v0.0.7: used stratified sampling (by ac type) and CB loss
 v0.0.8: used stratified sampling (by ac type & by duration quantile)
 v0.0.9: switched to hypernetworks, seed 24 RMSE: 228.2 -> 212.68
 v0.0.9+dev1: concat aircraft type embedding to final layer, seed 24 RMSE: 212.68 -> 208.58
+
 -->
 
 ### Class Imbalance

@@ -28,15 +28,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-TrajectoryFeature = Literal[
-    "time_since_takeoff",
-    "time_till_arrival",
+StateFeature = Literal[
     "altitude",
     "groundspeed",
     "vertical_rate",
     # "track_rate",
 ]
-TRAJECTORY_FEATURES = get_args(TrajectoryFeature)
+STATE_FEATURES = get_args(StateFeature)
+FlightFeature = Literal["flight_progress", "flight_duration"]
+FLIGHT_FEATURES = get_args(FlightFeature)
+
+MODEL_INPUT_FEATURES: list[str] = [
+    *FLIGHT_FEATURES,
+    *STATE_FEATURES,
+]
 
 
 def make_splits(
@@ -719,7 +724,7 @@ class Stat(TypedDict):
     std: float
 
 
-Stats: TypeAlias = dict[TrajectoryFeature, Stat]
+Stats: TypeAlias = dict[StateFeature | FlightFeature, Stat]
 
 
 def make_standardisation_stats(
@@ -731,35 +736,71 @@ def make_standardisation_stats(
     train_segment_ids = splits["train"]
     logger.info(f"computing standardisation stats from {len(train_segment_ids)} train segments")
 
+    fuel_lf = raw.scan_fuel(partition).filter(pl.col("idx").is_in(train_segment_ids))
+    train_flight_ids_df = fuel_lf.select("flight_id").unique().collect()
+    flight_list_df = (
+        raw.scan_flight_list(partition)
+        .filter(pl.col("flight_id").is_in(train_flight_ids_df["flight_id"]))
+        .collect()
+    )
+
+    flight_duration_s = (flight_list_df["landed"] - flight_list_df["takeoff"]).dt.total_seconds(
+        fractional=True
+    )
+    standardisation_stats: Stats = {
+        "flight_duration": {
+            "mean": flight_duration_s.mean(),
+            "std": flight_duration_s.std(),
+        }
+    }  # type: ignore
+
     trajectory_iterator = TrajectoryIterator(
         partition=partition,
         segment_ids=train_segment_ids,
         start_to_end_only=True,
     )
 
+    features_to_stat = [*STATE_FEATURES, "flight_progress"]
     running_stats = {
-        feature: {"sum": 0.0, "sum_sq": 0.0, "count": 0} for feature in TRAJECTORY_FEATURES
+        feature: {"sum": 0.0, "sum_sq": 0.0, "count": 0} for feature in features_to_stat
+    }
+
+    flight_id_to_duration = {
+        row["flight_id"]: (row["landed"] - row["takeoff"]).total_seconds()
+        for row in flight_list_df.iter_rows(named=True)
     }
 
     for trajectory in track(trajectory_iterator, description="computing stats from train segments"):
-        segment_df = trajectory.features_df.select(TRAJECTORY_FEATURES)
-        stats_for_segment = segment_df.select(
-            [pl.sum(col).alias(f"{col}_sum") for col in TRAJECTORY_FEATURES]
-            + [(pl.col(col).pow(2)).sum().alias(f"{col}_sum_sq") for col in TRAJECTORY_FEATURES]
-        ).row(0, named=True)
+        segment_df = trajectory.features_df
         count = len(segment_df)
-        for feature in TRAJECTORY_FEATURES:
+        if count == 0:
+            continue
+
+        duration_s = flight_id_to_duration.get(trajectory.info["flight_id"])
+        if duration_s is not None and duration_s > 0:
+            progress = (segment_df["timestamp"] - trajectory.info["takeoff"]).dt.total_seconds(
+                fractional=True
+            ) / duration_s
+            running_stats["flight_progress"]["sum"] += progress.sum()
+            running_stats["flight_progress"]["sum_sq"] += (progress**2).sum()
+            running_stats["flight_progress"]["count"] += count
+
+        stats_for_segment = segment_df.select(
+            [pl.sum(col).alias(f"{col}_sum") for col in STATE_FEATURES]
+            + [(pl.col(col).pow(2)).sum().alias(f"{col}_sum_sq") for col in STATE_FEATURES]
+        ).row(0, named=True)
+
+        for feature in STATE_FEATURES:
             running_stats[feature]["sum"] += stats_for_segment[f"{feature}_sum"] or 0
             running_stats[feature]["sum_sq"] += stats_for_segment[f"{feature}_sum_sq"] or 0
             running_stats[feature]["count"] += count
 
-    standardisation_stats: Stats = {}
     for feature, stats in running_stats.items():
         count = stats["count"]
-        assert count > 2
+        assert count > 2, f"not enough data for feature {feature}"
         mean = stats["sum"] / count
         variance = (stats["sum_sq"] / count) - (mean**2)
-        assert variance >= 1e-9
+        assert variance >= 1e-9, f"variance for {feature} is negative or too small"
         std = np.sqrt(variance)
 
         standardisation_stats[feature] = {"mean": mean, "std": std}
@@ -807,7 +848,10 @@ def prepare_iterator_data(
 
     flight_list_lf = raw.scan_flight_list(partition)
     segments_df = (
-        fuel_lf.join(flight_list_lf.select("flight_id", "takeoff", "aircraft_type"), on="flight_id")
+        fuel_lf.join(
+            flight_list_lf.select("flight_id", "takeoff", "landed", "aircraft_type"),
+            on="flight_id",
+        )
         .sort("flight_id")
         .collect()
     )
@@ -816,7 +860,7 @@ def prepare_iterator_data(
 
     if stats is not None:
         standardisation_exprs = [
-            ((pl.col(f) - stats[f]["mean"]) / stats[f]["std"]).alias(f) for f in TRAJECTORY_FEATURES
+            ((pl.col(f) - stats[f]["mean"]) / stats[f]["std"]).alias(f) for f in STATE_FEATURES
         ]
         traj_lf = traj_lf.with_columns(standardisation_exprs)
 
@@ -830,6 +874,7 @@ class TrajectoryInfo(TypedDict):
     end: datetime
     fuel_kg: float
     takeoff: datetime
+    landed: datetime
     aircraft_type: str
 
 
@@ -880,27 +925,22 @@ class TrajectoryIterator:
 
             for segment_info in self.segments_by_flight[flight_id]:
                 if self.start_to_end_only:
-                    start_relative = (
-                        segment_info["start"] - segment_info["takeoff"]
-                    ).total_seconds()
-                    end_relative = (segment_info["end"] - segment_info["takeoff"]).total_seconds()
-                    time_col_name = "time_since_takeoff"
+                    start_ts = segment_info["start"]
+                    end_ts = segment_info["end"]
 
-                    if self.stats:
-                        tst_stats = self.stats[time_col_name]
-                        start_relative = (start_relative - tst_stats["mean"]) / tst_stats["std"]
-                        end_relative = (end_relative - tst_stats["mean"]) / tst_stats["std"]
-
-                    # endpoints can sometimes be located *just* beyond the window so be safe.
                     start_idx, end_idx = find_segment_indices(
-                        flight_traj_df[time_col_name], start_relative - 1e-9, end_relative + 1e-9
+                        flight_traj_df["timestamp"].to_numpy(),
+                        np.datetime64(start_ts.isoformat()),
+                        np.datetime64(end_ts.isoformat()),
+                        xp=np,
                     )
                     segment_traj_df = flight_traj_df[start_idx:end_idx]
                     if segment_traj_df.height < 2:
                         logger.error(
                             f"skipping {flight_id}: found < 2 datapoints for segment "
-                            f"({start_relative} - {end_relative}): {start_idx}..={end_idx}"
+                            f"({start_ts} - {end_ts}): {start_idx}..={end_idx}"
                         )
+                        continue
                 else:
                     segment_traj_df = flight_traj_df
 

@@ -204,7 +204,6 @@ def train(
 
     import wandb
     from prc25.dataloader import VarlenDataset, collate_fn
-    from prc25.datasets import preprocessed
     from prc25.model import FuelBurnPredictor, FuelBurnPredictorConfig
 
     # NOTE: loading this takes 16GB of RAM on start, but drops to ~4GB
@@ -225,7 +224,7 @@ def train(
         logger.info(f"using cb loss with {beta=} on {class_counts=}: {weights=}")
 
     model_cfg = FuelBurnPredictorConfig(
-        input_dim=len(preprocessed.TRAJECTORY_FEATURES),
+        input_dim=train_dataset.all_features.shape[1],
         hidden_size=hidden_size,
         num_heads=num_heads,
         num_aircraft_types=len(train_dataset.ac_type_vocab),

@@ -594,11 +594,11 @@ def preprocessed_features_cdf(
     features_df = pl.concat(feature_frames)
     fuel_kg_np = np.array(fuel_kg)
 
-    num_features = len(preprocessed.TRAJECTORY_FEATURES)
+    num_features = len(preprocessed.STATE_FEATURES)
     fig_cdf, axes_cdf = plt.subplots(2, (num_features + 1 + 1) // 2, figsize=(20, 10))
     axes_cdf: list[Axes] = axes_cdf.flatten()  # type: ignore
 
-    for i, feature in enumerate(preprocessed.TRAJECTORY_FEATURES):
+    for i, feature in enumerate(preprocessed.STATE_FEATURES):
         ax = axes_cdf[i]
         data = features_df[feature].to_numpy()
         sorted_data = np.sort(data)
@@ -688,7 +688,7 @@ def _plot_varlen_batch(ax: Axes, data: VarlenBatch):
 
     x = np.arange(data.x.size(0))
 
-    for i, feature in enumerate(preprocessed.TRAJECTORY_FEATURES):
+    for i, feature in enumerate(preprocessed.STATE_FEATURES):
         ax.scatter(x, data.x[:, i].cpu().numpy(), label=feature, s=0.2)
 
     for offset in data.cu_seqlens.cpu().numpy():

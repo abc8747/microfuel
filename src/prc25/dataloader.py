@@ -44,6 +44,120 @@ VarlenBatch = namedtuple(
 )
 
 
+def _compute_and_standardise_features(
+    all_trajs_df: pl.DataFrame,
+    segments_with_boundaries_df: pl.DataFrame,
+    stats: preprocessed.Stats,
+) -> pl.DataFrame:
+    """Computes and standardizes features for all trajectories."""
+    flight_info_df = (
+        segments_with_boundaries_df.select("flight_id", "takeoff", "landed")
+        .unique("flight_id")
+        .with_columns(
+            flight_duration_s=(
+                (pl.col("landed") - pl.col("takeoff")).dt.total_seconds(fractional=True)
+            )
+        )
+    )
+    df = all_trajs_df.join(flight_info_df, on="flight_id", how="left")
+
+    standardisation_exprs = [
+        ((pl.col(f) - stats[f]["mean"]) / stats[f]["std"]).alias(f)
+        for f in preprocessed.STATE_FEATURES
+    ]
+    # NOTE: feature names in the final tensor must match MODEL_INPUT_FEATURES order
+    return df.with_columns(
+        flight_progress=(
+            (pl.col("timestamp") - pl.col("takeoff")).dt.total_seconds(fractional=True)
+            / pl.col("flight_duration_s")
+        )
+    ).with_columns(
+        flight_progress=(pl.col("flight_progress") - stats["flight_progress"]["mean"])
+        / stats["flight_progress"]["std"],
+        flight_duration=(pl.col("flight_duration_s") - stats["flight_duration"]["mean"])
+        / stats["flight_duration"]["std"],
+        *standardisation_exprs,
+    )
+
+
+def _prepare_tensors(
+    partition: Partition,
+    flight_ids: list[str],
+    segment_ids: list[int] | None,
+    stats: preprocessed.Stats,
+    ac_type_vocab: dict[str, int],
+) -> tuple[torch.Tensor, list[SequenceInfo]]:
+    """Loads data, computes features, and prepares tensors for the Dataset."""
+    it_data = preprocessed.prepare_iterator_data(partition, segment_ids, stats=None)
+    all_trajs_df = (
+        it_data.traj_lf.filter(pl.col("flight_id").is_in(flight_ids))
+        .sort("flight_id", "timestamp")
+        .collect()
+    )
+
+    flight_id_boundaries = (
+        all_trajs_df.with_row_index()
+        .group_by("flight_id", maintain_order=True)
+        .agg(pl.first("index").alias("start_idx"), pl.len().alias("length"))
+    )
+    segments_with_boundaries_df = it_data.segments_df.join(
+        flight_id_boundaries, on="flight_id", how="inner"
+    )
+
+    featured_df = _compute_and_standardise_features(
+        all_trajs_df, segments_with_boundaries_df, stats
+    )
+
+    all_features_tensor = featured_df.select(preprocessed.MODEL_INPUT_FEATURES).to_torch(
+        dtype=pl.Float32
+    )
+    timestamps_all_np = featured_df["timestamp"].to_numpy()
+
+    sequences: list[SequenceInfo] = []
+    for row in track(
+        segments_with_boundaries_df.iter_rows(named=True),
+        description=f"indexing sequences for {partition}/?",
+        total=len(segments_with_boundaries_df),
+    ):
+        flight_start_idx, flight_len = row["start_idx"], row["length"]
+        flight_timestamps = timestamps_all_np[flight_start_idx : flight_start_idx + flight_len]
+
+        start_offset, end_offset = preprocessed.find_segment_indices(
+            flight_timestamps,
+            np.datetime64(row["start"].isoformat()),
+            np.datetime64(row["end"].isoformat()),
+            xp=np,
+        )
+
+        if (end_offset - start_offset) < 2:
+            logger.error(
+                f"expected {row['flight_id']}/{row['idx']} to have "
+                f"at least two datapoints, but got {end_offset - start_offset} points for "
+                f"({row['start']} - {row['end']})."
+            )
+            continue
+
+        flight_end_idx = flight_start_idx + flight_len
+        segment_indices_relative = (start_offset.item(), end_offset.item())
+
+        duration_s = (row["end"] - row["start"]).total_seconds()
+        target = np.log1p((row["fuel_kg"] or np.nan) / duration_s)
+        ac_type_idx = ac_type_vocab[row["aircraft_type"]]
+
+        sequences.append(
+            SequenceInfo(
+                flight_indices=(flight_start_idx, flight_end_idx),
+                segment_indices_relative=segment_indices_relative,
+                target=target,
+                segment_id=row["idx"],
+                aircraft_type_idx=ac_type_idx,
+                duration_s=duration_s,
+                flight_id=row["flight_id"],
+            )
+        )
+    return all_features_tensor, sequences
+
+
 class VarlenDataset(Dataset):
     def __init__(self, partition: Partition, split: Split | None):
         if split:
@@ -70,83 +184,11 @@ class VarlenDataset(Dataset):
         # always get train stats for submission
         stats_partition: Partition = partition.removesuffix("_rank")  # type: ignore
         self.stats = preprocessed.load_standardisation_stats(stats_partition)
-
         self.ac_type_vocab = {ac_type: i for i, ac_type in enumerate(AIRCRAFT_TYPES)}
 
-        it_data = preprocessed.prepare_iterator_data(partition, segment_ids, self.stats)
-        all_trajs_df = (
-            it_data.traj_lf.filter(pl.col("flight_id").is_in(flight_ids))
-            .sort("flight_id", "timestamp")
-            .collect()
+        self.all_features, self.sequences = _prepare_tensors(
+            partition, flight_ids, segment_ids, self.stats, self.ac_type_vocab
         )
-
-        flight_id_boundaries = (
-            all_trajs_df.with_row_index()
-            .group_by("flight_id", maintain_order=True)
-            .agg(pl.first("index").alias("start_idx"), pl.len().alias("length"))
-        )
-        segments_with_boundaries = it_data.segments_df.join(
-            flight_id_boundaries, on="flight_id", how="inner"
-        )
-
-        self.all_features = all_trajs_df.select(preprocessed.TRAJECTORY_FEATURES).to_torch(
-            dtype=pl.Float32
-        )
-        # we no longer have `timestamp` here so we must locate a segment using `time_since_takeoff`
-        time_since_takeoff_all_std = self.all_features[:, 0]
-        tst_stats = self.stats["time_since_takeoff"]
-        tst_mean, tst_std = tst_stats["mean"], tst_stats["std"]
-
-        self.sequences: list[SequenceInfo] = []
-        for row in track(
-            segments_with_boundaries.iter_rows(named=True),
-            description=f"loading {split or partition} data",
-            total=len(segments_with_boundaries),
-        ):
-            flight_start_idx, flight_len = row["start_idx"], row["length"]
-            time_since_takeoff_flight_std = time_since_takeoff_all_std[
-                flight_start_idx : flight_start_idx + flight_len
-            ].contiguous()
-
-            start_relative = (row["start"] - row["takeoff"]).total_seconds()
-            end_relative = (row["end"] - row["takeoff"]).total_seconds()
-
-            start_relative_std = (start_relative - tst_mean) / tst_std
-            end_relative_std = (end_relative - tst_mean) / tst_std
-
-            start_offset, end_offset = preprocessed.find_segment_indices(
-                time_since_takeoff_flight_std,
-                start_relative_std - 1e-9,
-                end_relative_std + 1e-9,
-                xp=torch,
-            )
-
-            if (end_offset - start_offset) < 2:
-                logger.error(
-                    f"expected {row['flight_id']}/{row['idx']} to have "
-                    f"at least two datapoints, but got {end_offset - start_offset} points for "
-                    f"({row['start']} - {row['end']})."
-                )
-                continue
-
-            flight_end_idx = flight_start_idx + flight_len
-            segment_indices_relative = (start_offset.item(), end_offset.item())
-
-            duration_s = (row["end"] - row["start"]).total_seconds()
-            target = np.log1p((row["fuel_kg"] or np.nan) / duration_s)
-            ac_type_idx = self.ac_type_vocab[row["aircraft_type"]]  # unknown types should panic.
-
-            self.sequences.append(
-                SequenceInfo(
-                    flight_indices=(flight_start_idx, flight_end_idx),
-                    segment_indices_relative=segment_indices_relative,
-                    target=target,
-                    segment_id=row["idx"],
-                    aircraft_type_idx=ac_type_idx,
-                    duration_s=duration_s,
-                    flight_id=row["flight_id"],
-                )
-            )
 
         counts = Counter(s.aircraft_type_idx for s in self.sequences)
         self.class_counts = torch.tensor([counts[i] for i in range(len(self.ac_type_vocab))])
