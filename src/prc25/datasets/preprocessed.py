@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     import isqx
     import isqx.aerospace
 
-    from .. import AirportIcao, FlightId, Split
+    from .. import AirportIcao, FlightId, SegmentId, Split
 
 
 logger = logging.getLogger(__name__)
@@ -45,32 +45,131 @@ def make_splits(
     seed: int = 13,
     *,
     path_base: Path = PATH_PREPROCESSED,
-):
+    max_bins: int = 30,
+    min_samples_for_binning: int = 2,
+):  # TODO: allow k fold stratified splits
     path_base.mkdir(exist_ok=True, parents=True)
     flight_list_lf = raw.scan_flight_list(partition)
     fuel_lf = raw.scan_fuel(partition)
 
-    flight_ids_with_fuel = (
-        flight_list_lf.join(fuel_lf, on="flight_id")
-        .select("flight_id")
-        .unique()
-        .sort("flight_id")
+    segments_df = (
+        fuel_lf.with_columns(
+            (pl.col("end") - pl.col("start")).dt.total_seconds().alias("duration_s")
+        )
+        .join(flight_list_lf.select("flight_id", "aircraft_type"), on="flight_id")
+        .select("idx", "aircraft_type", "duration_s")
+        .sort("idx")
         .collect()
-        .to_series()
-        .shuffle(seed=seed)
-        .to_list()
     )
+    logger.info(f"found {len(segments_df)} segments with fuel data in `{partition}`")
+
+    bin_boundaries_data = []
+
+    def add_duration_bin(group_df: pl.DataFrame) -> pl.DataFrame:
+        ac_type = group_df["aircraft_type"][0]
+        duration_series = group_df["duration_s"]
+        n_samples = duration_series.len()
+        assert n_samples > 0
+
+        duration_quantiles = (
+            min(max_bins, int(1 + np.log2(n_samples)))
+            if n_samples >= min_samples_for_binning
+            else 1
+        )
+
+        quantile_points = np.linspace(0, 1, duration_quantiles + 1)
+        breaks_set: set[float] = set()
+        for q in quantile_points:
+            b = duration_series.quantile(q, interpolation="linear")
+            assert b is not None
+            breaks_set.add(b)
+        breaks = sorted(breaks_set)
+
+        if len(breaks) < 2:
+            min_val = float(duration_series.min() or 0)  # type: ignore
+            max_val = float(duration_series.max() or 1)  # type: ignore
+            breaks = [min_val, max_val] if min_val != max_val else [min_val, min_val + 1]
+
+        # last break should be inclusive of the max value
+        max_dur = float(duration_series.max())  # type: ignore
+        if max_dur is not None and breaks[-1] < max_dur:
+            breaks[-1] = max_dur
+
+        labels = [f"d_q{i}" for i in range(len(breaks) - 1)]
+        for i, label in enumerate(labels):
+            bin_boundaries_data.append(
+                {
+                    "aircraft_type": ac_type,
+                    "duration_bin": label,
+                    "lower_bound": breaks[i],
+                    "upper_bound": breaks[i + 1],
+                }
+            )
+
+        bin_expr = pl.when(pl.col("duration_s") <= breaks[1]).then(pl.lit(labels[0]))
+        for i in range(2, len(breaks) - 1):
+            bin_expr = bin_expr.when(pl.col("duration_s") <= breaks[i]).then(pl.lit(labels[i - 1]))
+        bin_expr = bin_expr.otherwise(pl.lit(labels[-1]))
+
+        return group_df.with_columns(bin_expr.alias("duration_bin"))
+
+    segments_binned_df = segments_df.group_by("aircraft_type", maintain_order=True).map_groups(
+        add_duration_bin
+    )
+    bin_boundaries_df = pl.DataFrame(bin_boundaries_data)
+
+    stratify_cols = ["aircraft_type", "duration_bin"]
+    n_train_samples_expr = pl.max_horizontal(1, (pl.count() * train_split).floor())
+    train_df = segments_binned_df.filter(
+        pl.int_range(0, pl.count()).shuffle(seed=seed).over(stratify_cols)
+        < n_train_samples_expr.over(stratify_cols)
+    )
+
+    train_segment_ids_set = set(train_df["idx"].to_list())
+    all_segment_ids_set = set(segments_binned_df["idx"].to_list())
+    validation_segment_ids_set = all_segment_ids_set - train_segment_ids_set
+
+    segment_ids_train = sorted(list(train_segment_ids_set))
+    segment_ids_validation = sorted(list(validation_segment_ids_set))
+
     logger.info(
-        f"found {len(flight_ids_with_fuel)} flights with fuel data in partition `{partition}`"
+        f"stratified split by {stratify_cols}: {len(segment_ids_train)} train, {len(segment_ids_validation)} validation"
     )
 
-    split_idx = int(len(flight_ids_with_fuel) * train_split)
-    flight_ids_train = flight_ids_with_fuel[:split_idx]
-    flight_ids_validation = flight_ids_with_fuel[split_idx:]
+    train_counts_df = train_df.group_by(stratify_cols).len().rename({"len": "train_count"})
+    validation_df = segments_binned_df.filter(pl.col("idx").is_in(validation_segment_ids_set))
+    validation_counts_df = (
+        validation_df.group_by(stratify_cols).len().rename({"len": "validation_count"})
+    )
 
-    splits: dict[Split, list[FlightId]] = {
-        "train": flight_ids_train,
-        "validation": flight_ids_validation,
+    all_groups_df = segments_binned_df.select(stratify_cols).unique().sort(stratify_cols)
+    combined_counts_df = (
+        all_groups_df.join(train_counts_df, on=stratify_cols, how="left")
+        .join(validation_counts_df, on=stratify_cols, how="left")
+        .fill_null(0)
+    )
+
+    logging_df = combined_counts_df.join(bin_boundaries_df, on=stratify_cols, how="left")
+
+    logger.info("split counts by stratification groups:")
+    _ac_types: set[str] = set()
+    for row in logging_df.sort(["aircraft_type", "duration_bin"]).iter_rows(named=True):
+        ac_type = t if (t := row["aircraft_type"]) not in _ac_types else ""
+        _ac_types.add(row["aircraft_type"])
+        lower = row["lower_bound"]
+        upper = row["upper_bound"]
+        train_count = row["train_count"]
+        validation_count = row["validation_count"]
+        total = train_count + validation_count
+        train_pct = train_count / total if total > 0 else 0
+        duration_str = f"({lower or 0:.0f}s-{upper or 0:.0f}s]"
+        logger.info(
+            f"  {ac_type:<5}{duration_str:<14}: {train_count:>5}/{validation_count:>5} ({train_pct:5.1%})"
+        )
+
+    splits: dict[Split, list[SegmentId]] = {
+        "train": segment_ids_train,
+        "validation": segment_ids_validation,
     }
     output_path = path_base / f"splits_{partition}.json"
     with open(output_path, "w") as f:
@@ -430,7 +529,7 @@ def make_trajectories(
         )
         track_rate_outlier_mask = track_rate_smooth > track_rate_max
         gs_track_outlier_mask = gs_smooth_outlier_mask | track_rate_outlier_mask
-        # if ground speed or track rate fucked up, altitude is probably fucked as well
+        # ground speed and track rate are derived from ve and vn if either fails, set as outlier.
         gs_smooth[gs_track_outlier_mask] = np.nan
         track_rate_smooth[gs_track_outlier_mask] = np.nan
 
@@ -625,41 +724,45 @@ Stats: TypeAlias = dict[TrajectoryFeature, Stat]
 
 def make_standardisation_stats(
     partition: Partition,
-    subset_fraction: float | None = None,
     *,
     path_base: Path = PATH_PREPROCESSED,
 ):
     splits = load_splits(partition, path_base=path_base)
-    train_flight_ids = splits["train"]
-
-    if subset_fraction is not None:  # hack to avoid OOM
-        n_flights = len(train_flight_ids)
-        train_flight_ids = train_flight_ids[: int(n_flights * subset_fraction)]
-    logger.info(f"computing standardisation stats from {len(train_flight_ids)} train flights")
+    train_segment_ids = splits["train"]
+    logger.info(f"computing standardisation stats from {len(train_segment_ids)} train segments")
 
     trajectory_iterator = TrajectoryIterator(
         partition=partition,
-        flight_ids=train_flight_ids,
+        segment_ids=train_segment_ids,
         start_to_end_only=True,
     )
-    all_segment_dfs = []
-    for trajectory in track(trajectory_iterator, description="collecting train segments for stats"):
-        segment_features_lf = trajectory.features_df.lazy().select(TRAJECTORY_FEATURES)
-        all_segment_dfs.append(segment_features_lf)
-    train_segments_lf = pl.concat(all_segment_dfs)
 
-    stats_df = train_segments_lf.select(
-        [pl.mean(col).alias(f"{col}_mean") for col in TRAJECTORY_FEATURES]
-        + [pl.std(col).alias(f"{col}_std") for col in TRAJECTORY_FEATURES]
-    ).collect()
+    running_stats = {
+        feature: {"sum": 0.0, "sum_sq": 0.0, "count": 0} for feature in TRAJECTORY_FEATURES
+    }
+
+    for trajectory in track(trajectory_iterator, description="computing stats from train segments"):
+        segment_df = trajectory.features_df.select(TRAJECTORY_FEATURES)
+        stats_for_segment = segment_df.select(
+            [pl.sum(col).alias(f"{col}_sum") for col in TRAJECTORY_FEATURES]
+            + [(pl.col(col).pow(2)).sum().alias(f"{col}_sum_sq") for col in TRAJECTORY_FEATURES]
+        ).row(0, named=True)
+        count = len(segment_df)
+        for feature in TRAJECTORY_FEATURES:
+            running_stats[feature]["sum"] += stats_for_segment[f"{feature}_sum"] or 0
+            running_stats[feature]["sum_sq"] += stats_for_segment[f"{feature}_sum_sq"] or 0
+            running_stats[feature]["count"] += count
 
     standardisation_stats: Stats = {}
-    row = stats_df.row(0, named=True)
-    for feature in TRAJECTORY_FEATURES:
-        standardisation_stats[feature] = {
-            "mean": row[f"{feature}_mean"],
-            "std": row[f"{feature}_std"],
-        }
+    for feature, stats in running_stats.items():
+        count = stats["count"]
+        assert count > 2
+        mean = stats["sum"] / count
+        variance = (stats["sum_sq"] / count) - (mean**2)
+        assert variance >= 1e-9
+        std = np.sqrt(variance)
+
+        standardisation_stats[feature] = {"mean": mean, "std": std}
 
     output_path = path_base / f"stats_{partition}.json"
     with open(output_path, "w") as f:
@@ -674,7 +777,7 @@ def make_standardisation_stats(
 
 def load_splits(
     partition: Partition, *, path_base: Path = PATH_PREPROCESSED
-) -> dict[Split, list[FlightId]]:
+) -> dict[Split, list[SegmentId]]:
     with open(path_base / f"splits_{partition}.json") as f:
         return json.load(f)
 
@@ -693,14 +796,14 @@ class IteratorData(NamedTuple):
 
 def prepare_iterator_data(
     partition: Partition,
-    flight_ids: Collection[FlightId] | None = None,
+    segment_ids: Collection[SegmentId] | None = None,
     stats: Stats | None = None,
     path_base: Path = PATH_PREPROCESSED,
 ) -> IteratorData:
     """Prepares data required by the dataloader."""
     fuel_lf = raw.scan_fuel(partition)
-    if flight_ids:
-        fuel_lf = fuel_lf.filter(pl.col("flight_id").is_in(flight_ids))
+    if segment_ids:
+        fuel_lf = fuel_lf.filter(pl.col("idx").is_in(segment_ids))
 
     flight_list_lf = raw.scan_flight_list(partition)
     segments_df = (
@@ -742,7 +845,7 @@ class TrajectoryIterator:
         self,
         partition: Partition,
         *,
-        flight_ids: Collection[FlightId] | None = None,
+        segment_ids: Collection[SegmentId] | None = None,
         shuffle_seed: int | None = None,
         stats: Stats | None = None,
         start_to_end_only: bool = False,
@@ -753,7 +856,7 @@ class TrajectoryIterator:
             Note that collecting this iterator will use a lot of memory due to duplicates!
             Prefer using the torch iterator instead.
         """
-        it_data = prepare_iterator_data(partition, flight_ids, stats, path_base)
+        it_data = prepare_iterator_data(partition, segment_ids, stats, path_base)
         self.traj_lf = it_data.traj_lf
         self.segment_infos: list[TrajectoryInfo] = it_data.segments_df.to_dicts()  # type: ignore
         self.start_to_end_only = start_to_end_only

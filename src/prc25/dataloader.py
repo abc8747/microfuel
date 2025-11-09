@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from collections import namedtuple
+from collections import Counter, namedtuple
 
 import numpy as np
 import polars as pl
@@ -10,7 +10,7 @@ from rich.progress import track
 from torch.utils.data import Dataset
 
 from . import AIRCRAFT_TYPES, Partition, Split
-from .datasets import preprocessed
+from .datasets import preprocessed, raw
 
 logger = logging.getLogger(__name__)
 
@@ -48,10 +48,17 @@ class VarlenDataset(Dataset):
     def __init__(self, partition: Partition, split: Split | None):
         if split:
             splits = preprocessed.load_splits(partition)
-            flight_ids = splits[split]
+            segment_ids = splits[split]
+            flight_ids = (
+                raw.scan_fuel(partition)
+                .filter(pl.col("idx").is_in(segment_ids))
+                .select("flight_id")
+                .unique()
+                .collect()["flight_id"]
+                .to_list()
+            )
         else:
-            from .datasets import raw
-
+            segment_ids = None
             flight_ids = (
                 raw.scan_fuel(partition)
                 .select("flight_id")
@@ -65,11 +72,8 @@ class VarlenDataset(Dataset):
         self.stats = preprocessed.load_standardisation_stats(stats_partition)
 
         self.ac_type_vocab = {ac_type: i for i, ac_type in enumerate(AIRCRAFT_TYPES)}
-        self.ac_type_vocab["UNK"] = len(self.ac_type_vocab)
-        # TODO: for some reason removing UNK worsens performance significantly
-        # but UNK is unused so maybe something with the initialisation.
 
-        it_data = preprocessed.prepare_iterator_data(partition, flight_ids, self.stats)
+        it_data = preprocessed.prepare_iterator_data(partition, segment_ids, self.stats)
         all_trajs_df = (
             it_data.traj_lf.filter(pl.col("flight_id").is_in(flight_ids))
             .sort("flight_id", "timestamp")
@@ -130,7 +134,7 @@ class VarlenDataset(Dataset):
 
             duration_s = (row["end"] - row["start"]).total_seconds()
             target = np.log1p((row["fuel_kg"] or np.nan) / duration_s)
-            ac_type_idx = self.ac_type_vocab.get(row["aircraft_type"], self.ac_type_vocab["UNK"])
+            ac_type_idx = self.ac_type_vocab[row["aircraft_type"]]  # unknown types should panic.
 
             self.sequences.append(
                 SequenceInfo(
@@ -143,6 +147,9 @@ class VarlenDataset(Dataset):
                     flight_id=row["flight_id"],
                 )
             )
+
+        counts = Counter(s.aircraft_type_idx for s in self.sequences)
+        self.class_counts = torch.tensor([counts[i] for i in range(len(self.ac_type_vocab))])
 
     def __len__(self) -> int:
         return len(self.sequences)

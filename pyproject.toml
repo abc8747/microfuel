@@ -20,7 +20,7 @@ dependencies = [
 
 [project.optional-dependencies]
 cli = ["typer>=0.19"]
-plots = ["matplotlib>=3.10", "networkx[default]>=3.4.2"]
+plots = ["matplotlib>=3.10"]
 pyqt6 = ["pyqt6>=6.10.0"]
 
 [dependency-groups]

@@ -4,3 +4,13 @@ fmt:
 
 dump:
     u dump -i docs/assets -i data -i mkdocs.yml -i pyproject.toml -i justfile
+
+train:
+    #!/usr/bin/env bash
+    for seed in 24; do
+        uv run scripts/main.py create-splits phase1 --seed $seed
+        for beta in 0.99; do
+            # uv run scripts/main.py evaluate data/checkpoints/gdn-all_ac-v0.0.8+seed${seed}+cb${beta}/best.pt
+            uv run scripts/main.py train --exp-name gdn-all_ac-v0.0.8+seed${seed}+cb${beta} --beta ${beta}
+        done
+    done

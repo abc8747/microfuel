@@ -84,71 +84,6 @@ def flight_duration_cdf() -> None:
 
 
 @app.command()
-def od_graph() -> None:
-    fig = p.default_fig(figsize=(13, 12))
-    ax = fig.add_subplot(111)
-    df = raw.scan_flight_list("phase1").collect()
-
-    top_routes = df.group_by(["origin_icao", "destination_icao"]).len().sort("len", descending=True)
-
-    graph = nx.DiGraph()
-
-    for row in top_routes.iter_rows(named=True):
-        graph.add_edge(row["origin_icao"], row["destination_icao"], weight=row["len"])
-
-    degrees: list[int] = [graph.degree(node) for node in graph.nodes()]  # type: ignore
-    node_sizes = [min(d * 50, 500) for d in degrees]
-
-    min_degree = min(degrees)
-    max_degree = max(degrees)
-    font_sizes = {
-        node: 2 + (d - min_degree) / (max_degree - min_degree) * 5
-        for node, d in zip(graph.nodes(), degrees)
-    }
-    labels = {node: f"{node}\n({d})" for node, d in zip(graph.nodes(), degrees)}
-
-    normalized_degrees = {
-        node: (d - min_degree) / (max_degree - min_degree)
-        for node, d in zip(graph.nodes(), degrees)
-    }
-    font_colors = {
-        node: "black" if norm_d > 0.5 else "white" for node, norm_d in normalized_degrees.items()
-    }
-
-    pos = nx.spring_layout(graph, k=15, iterations=1000, seed=13, scale=2)
-
-    nodes = nx.draw_networkx_nodes(
-        graph,
-        pos,
-        node_size=node_sizes,
-        node_color=degrees,  # type: ignore
-        cmap="viridis",
-        ax=ax,
-    )
-    nx.draw_networkx_labels(
-        graph,
-        pos,
-        labels=labels,
-        font_size=font_sizes,  # type: ignore
-        font_color=font_colors,  # type: ignore
-        ax=ax,
-    )
-    nx.draw_networkx_edges(
-        graph, pos, arrows=True, arrowsize=10, edge_color="gray", width=1, alpha=0.5, ax=ax
-    )
-
-    cbar = plt.colorbar(nodes, ax=ax)
-    cbar.set_label("Node Degree")
-
-    ax.axis("off")
-
-    output_path = PATH_PLOTS_OUTPUT / "od_graph.pdf"
-    fig.savefig(output_path, bbox_inches="tight")
-    plt.close(fig)
-    logger.info(f"wrote {output_path}")
-
-
-@app.command()
 def speed_alt_fuel_burn(max_points_per_actype: float | None = 1000) -> None:
     """This is a very slow plot: takes ~1 minute"""
     fig = p.default_fig(figsize=(20, 20))
@@ -361,6 +296,74 @@ def time_gap_cdf() -> None:
     logger.info(f"wrote plot to {output_path}")
 
 
+@app.command()
+def fuel_burn_segment_duration(partition: Partition = "phase1"):
+    import matplotlib.gridspec as gridspec
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from rich.progress import track
+
+    from prc25 import AIRCRAFT_TYPES
+    from prc25.datasets import raw
+
+    fuel_df = raw.scan_fuel(partition).collect()
+    flight_list_df = raw.scan_flight_list(partition).select("flight_id", "aircraft_type").collect()
+    df = fuel_df.join(flight_list_df, on="flight_id").with_columns(
+        (pl.col("end") - pl.col("start")).dt.total_seconds().alias("duration_s")
+    )
+
+    N_ROWS = 5
+    top_ac_types = AIRCRAFT_TYPES[: N_ROWS * N_ROWS]
+    fig = plt.figure(figsize=(5 * N_ROWS, 5 * N_ROWS))
+    gs = gridspec.GridSpec(N_ROWS, N_ROWS, hspace=0.05 * N_ROWS, wspace=0.05 * N_ROWS)
+    axes = [fig.add_subplot(gs[i]) for i in range(N_ROWS * N_ROWS)]
+
+    for i, ac_type in enumerate(track(top_ac_types)):
+        ax = axes[i]
+        subset = df.filter(pl.col("aircraft_type") == ac_type)
+        duration = subset["duration_s"].to_numpy()
+        fuel = subset["fuel_kg"].to_numpy()
+
+        color = f"C{i % 10}"
+
+        ax.scatter(
+            duration,
+            fuel,
+            s=0.3,
+            linewidth=0,
+            color=color,
+        )
+
+        title = f"{ac_type} (n={len(subset)})"
+        valid = (duration > 0) & (fuel > 0)
+        if valid.sum() > 1:
+            log_duration = np.log10(duration[valid])
+            log_fuel = np.log10(fuel[valid])
+            coeffs = np.polyfit(log_duration, log_fuel, 1)
+            slope, intercept = coeffs
+
+            duration_sorted = np.sort(duration[valid])
+            trendline = 10 ** (slope * np.log10(duration_sorted) + intercept)
+
+            ax.plot(duration_sorted, trendline, color=color, linewidth=0.5, alpha=0.8)
+            title += f"\n$y = {10**intercept:.2f} x^{{{slope:.2f}}}$"
+
+        ax.set_title(title, fontsize=10)
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.grid(True, alpha=0.2, which="both")
+
+        if i // N_ROWS == 4:
+            ax.set_xlabel("Segment Duration (s)")
+        if i % N_ROWS == 0:
+            ax.set_ylabel("Fuel Burn (kg)")
+
+    output_path = PATH_PLOTS_OUTPUT / "fuel_burn_segment_duration.png"
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"wrote plot to {output_path}")
+
+
 #
 # preprocessed
 #
@@ -392,8 +395,8 @@ def segment_distributions() -> None:
     seq_lens_all = df_all["seq_len"].to_numpy()
     durations_all = df_all["duration_s"].to_numpy()
 
-    fig = plt.figure(figsize=(16, 20))
-    gs = gridspec.GridSpec(3, 1, height_ratios=[1, 1, 2])
+    fig = plt.figure(figsize=(16, 32))
+    gs = gridspec.GridSpec(4, 1, height_ratios=[1, 1, 2, 2], hspace=0.5)
 
     ax_seq_len_cdf = fig.add_subplot(gs[0])
     ax_duration_cdf = fig.add_subplot(gs[1])
@@ -490,6 +493,72 @@ def segment_distributions() -> None:
     ax_ac_dist.legend()
     ax_ac_dist.grid(True, axis="x", alpha=0.3)
 
+    gs_bottom = gridspec.GridSpecFromSubplotSpec(1, 2, subplot_spec=gs[3], wspace=0.3)
+    ax_seq_len_whisker = fig.add_subplot(gs_bottom[0])
+    ax_duration_whisker = fig.add_subplot(gs_bottom[1])
+
+    combined_df = pl.concat(
+        [
+            df_all.with_columns(pl.lit("phase1").alias("partition")),
+            df_rank.with_columns(pl.lit("phase1_rank").alias("partition")),
+        ]
+    )
+
+    ordered_ac_types = ac_dist_all["aircraft_type"].to_list()
+    y_pos = np.arange(len(ordered_ac_types))
+
+    def _plot_whiskers(ax, data_df, value_col, title, xlabel):
+        box_width = 0.4
+        colors = {"phase1": "C1", "phase1_rank": "C0"}
+        positions = {"phase1": y_pos - box_width / 2, "phase1_rank": y_pos + box_width / 2}
+
+        for partition in ["phase1", "phase1_rank"]:
+            partition_data = []
+            for ac_type in ordered_ac_types:
+                series = data_df.filter(
+                    (pl.col("aircraft_type") == ac_type) & (pl.col("partition") == partition)
+                )[value_col]
+                partition_data.append(series.to_numpy())
+
+            bp = ax.boxplot(
+                partition_data,
+                positions=positions[partition],
+                vert=False,
+                widths=box_width,
+                patch_artist=True,
+                showfliers=False,
+            )
+            for patch in bp["boxes"]:
+                patch.set_facecolor(colors[partition])
+                patch.set_alpha(0.7)
+
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(ordered_ac_types)
+        ax.invert_yaxis()
+        ax.set_xscale("log")
+        ax.set_xlabel(xlabel)
+        ax.set_title(title)
+        ax.grid(True, axis="x", which="both", alpha=0.3)
+        ax.legend(
+            [plt.Rectangle((0, 0), 1, 1, color=c) for c in colors.values()],
+            colors.keys(),
+        )
+
+    _plot_whiskers(
+        ax_seq_len_whisker,
+        combined_df,
+        "seq_len",
+        "Sequence Length Distribution by Aircraft Type",
+        "Sequence Length",
+    )
+    _plot_whiskers(
+        ax_duration_whisker,
+        combined_df,
+        "duration_s",
+        "Segment Duration Distribution by Aircraft Type",
+        "Segment Duration (s)",
+    )
+
     output_path = PATH_PLOTS_OUTPUT / "segment_distributions.png"
     fig.savefig(output_path, bbox_inches="tight", dpi=300)
     plt.close(fig)
@@ -509,11 +578,11 @@ def preprocessed_features_cdf(
     from prc25.datasets.preprocessed import TrajectoryIterator
 
     splits = preprocessed.load_splits(partition)
-    flight_ids = splits[split]
+    segment_ids = splits[split]
 
     iterator = TrajectoryIterator(
         partition=partition,
-        flight_ids=flight_ids,
+        segment_ids=segment_ids,
         start_to_end_only=True,
     )
 
@@ -862,7 +931,7 @@ def runs_multi_predictions():
 
     for f in PATH_PREDICTIONS.glob("*.parquet"):
         run_id = f.stem.removeprefix("gdn-all_ac-").removesuffix("_validation")
-        if not run_id.startswith("v0.0.6+seed"):
+        if not run_id.startswith("v0.0.8+seed") or not run_id.endswith("+cb0.99"):
             continue
         lf = pl.scan_parquet(f)
         yield run_id, lf

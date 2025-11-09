@@ -14,6 +14,7 @@ PATH_PREDICTIONS = PATH_DATA / "predictions"
 
 FlightId: TypeAlias = str
 """Unique flight identifier: `prc_{}`"""
+SegmentId: TypeAlias = int
 AircraftType: TypeAlias = Literal[
     "A20N",  # 29.17%
     "A320",  # 27.39%

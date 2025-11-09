@@ -64,12 +64,11 @@ To handle noisy and missing data, we apply a constant-velocity Kalman filter and
 The input vector at each time step $i$ is a concatenation of standardised observations $o_i$, temporal features, and a learned aircraft type embedding:
 
 $$
-x_i = [o_i, \tau_{ii}, \tau_{if}, \text{Embedding}(\text{aircraft\_type})]
+x_i = [o_i, t_i - t_0, t_f - t_i, \text{Embedding}(\text{aircraft\_type})]
 $$
 
 - $o_i$: Standardised observations from the preprocessed trajectory, including altitude, groundspeed, and vertical rate.
-- $\tau_{ii}$: Time since takeoff, $t_i - t_{\text{takeoff}}$, providing global temporal context.
-- $\tau_{if}$: Time till arrival, $t_\text{arrival} - t_i$
+- $t_0$, $t_f$: takeoff and arrival time.
 - aircraft type: a categorical feature drawn from a long-tailed distribution
 
 Several other features were experimented with but did not improve performance, including time gaps between observations ($\Delta t_i$), `time2vec` embeddings, and physics-informed features like $\frac{T - D}{m} = \underbrace{\frac{dV}{dt} + g \frac{dh}{dt}}_{\text{Specific Energy Rate}} + \text{wind effect}$ and a $\frac{C_L S}{m} = \frac{g\cos\gamma}{\frac{1}{2}\rho V^2 \cos\phi}$. Noisy sequences are usually the culprit (e.g. $\dot{V}$, $\ddot{h}$)
@@ -99,7 +98,25 @@ Finetuning with a loss function that directly weights by segment duration (`rmse
 
 ^ this incorrectly refers to seed 13 of train/validation split constructed from random sampling. more runs reveal RMSE of between 200-350.
 
-<!-- v0.0.6: introduced warmup and gradient clipping to stabilise training.  -->
+<!-- v0.0.6: introduced warmup and gradient clipping to stabilise training.
+v0.0.7: used stratified sampling (by ac type) and CB loss
+v0.0.8: used stratified sampling (by ac type & by duration quantile) -->
+
+### Class Imbalance
+
+The aircraft type distribution follows a power law, causing the model to be biased towards common aircraft types (e.g., A320, A20N) while performing poorly on rare types.
+
+We introduce an optional [Class-Balanced (CB) loss](https://arxiv.org/abs/1901.05555), weighing the loss based on the "effective number of samples", which posits that the marginal benefit of new data diminishes as sample size increases.
+
+The effective number of samples $E_n$ for a class with $n$ samples is:
+$$
+E_n = \frac{1 - \beta^n}{1 - \beta}
+$$
+where $\beta \in [0, 1)$ is a hyperparameter. The CB loss weights the loss for a class $y$ by $\frac{1}{E_{n_y}}$:
+$$
+\mathcal{L}_{\text{CB}}(\mathbf{p}, y) = \frac{1 - \beta}{1 - \beta^{n_y}} \mathcal{L}(\mathbf{p}, y)
+$$
+This up-weights the loss for rare classes, encouraging the model to learn their features more effectively.
 
 ## TODO
 

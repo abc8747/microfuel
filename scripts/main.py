@@ -164,9 +164,13 @@ def train(
     num_layers: int = 1,
     aircraft_embedding_dim: int = 8,
     pooler_mode: Literal["mean", "last"] = "last",
+    beta: Annotated[
+        float,
+        typer.Option(help="Hyperparameter for CB Loss. 0.0 means no reweighting."),
+    ] = 0.99,
     *,
     project_name: str = "prc25-multiac",
-    exp_name: str = "gdn-all_ac-v0.0.6+seed28",
+    exp_name: str = "gdn-all_ac-v0.0.8+?",
     resume_from: Annotated[
         Path | None, typer.Option(help="Path to checkpoint to resume training from.")
     ] = None,
@@ -196,6 +200,8 @@ def train(
 
     fla_autotuner_remove_nb()
     torch.manual_seed(seed)
+    import polars as pl
+
     import wandb
     from prc25.dataloader import VarlenDataset, collate_fn
     from prc25.datasets import preprocessed
@@ -210,6 +216,13 @@ def train(
     val_dataloader = DataLoader(
         val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn
     )
+    idx_to_ac_type = {i: ac for ac, i in train_dataset.ac_type_vocab.items()}
+    weights = None
+    if beta > 0.0:
+        class_counts = train_dataset.class_counts
+        effective_num = 1.0 - torch.pow(beta, class_counts.to(torch.float32))
+        weights = (1.0 - beta) / effective_num
+        logger.info(f"using cb loss with {beta=} on {class_counts=}: {weights=}")
 
     model_cfg = FuelBurnPredictorConfig(
         input_dim=len(preprocessed.TRAJECTORY_FEATURES),
@@ -329,12 +342,19 @@ def train(
                     device_type=device, dtype=torch.bfloat16, enabled=(device == "cuda")
                 ):
                     y_pred_log = model(x, cu_seqlens, aircraft_type_idx)
+                    loss_per_sample = criterion(y_pred_log, y_log)
+
+                    if weights is not None:
+                        weights = weights.to(device)
+                        batch_weights = weights[aircraft_type_idx]
+                        loss_per_sample = loss_per_sample * batch_weights.unsqueeze(1)
+
                     if loss_type == "rmse_rate":
-                        loss = criterion(y_pred_log, y_log).mean()
+                        loss = loss_per_sample.mean()
                     elif loss_type == "rmse_kg":
-                        loss = (criterion(y_pred_log, y_log) * durations.unsqueeze(1)).mean()
+                        loss = (loss_per_sample * durations.unsqueeze(1)).mean()
                     elif loss_type == "rmse_kg2":  # very unstable!
-                        loss = (criterion(y_pred_log, y_log) * durations.unsqueeze(1) ** 2).mean()
+                        loss = (loss_per_sample * durations.unsqueeze(1) ** 2).mean()
                     else:
                         assert_never(loss_type)
 
@@ -349,11 +369,25 @@ def train(
                     eval_result = _run_inference(
                         model, val_dataloader, device, progress, "validating", is_eval=True
                     )
+
+                    per_ac_rmse_df = (
+                        eval_result.df.with_columns(
+                            ((pl.col("y_pred_kg") - pl.col("y_true_kg")) ** 2).alias("se_kg")
+                        )
+                        .group_by("aircraft_type_idx")
+                        .agg(pl.mean("se_kg").sqrt().alias("rmse_kg"))
+                    )
+                    wandb_per_ac_metrics = {
+                        f"rmse_kg_val/{idx_to_ac_type[row['aircraft_type_idx']]}": row["rmse_kg"]
+                        for row in per_ac_rmse_df.iter_rows(named=True)
+                    }
+                    wandb_log_data = {
+                        "rmse_rate_val": eval_result.rmse_rate,
+                        "rmse_kg_val": eval_result.rmse_kg,
+                    }
+                    wandb_log_data.update(wandb_per_ac_metrics)
                     wandb.log(
-                        {
-                            "rmse_rate_val": eval_result.rmse_rate,
-                            "rmse_kg_val": eval_result.rmse_kg,
-                        },
+                        wandb_log_data,
                         step=global_step,
                     )
                     if eval_result.rmse_kg < best_val_rmse:
@@ -460,6 +494,7 @@ def _run_inference(
 
     model.eval()
     all_preds_rate, all_trues_rate, all_segment_ids, all_durations = [], [], [], []
+    all_aircraft_type_idxs = []  # needed for wandb logging per ac type
 
     with torch.no_grad():
         task = progress.add_task(description, total=len(dataloader))
@@ -481,6 +516,7 @@ def _run_inference(
             all_preds_rate.append(y_pred_rate.cpu())
             all_segment_ids.append(segment_ids)
             all_durations.append(durations)
+            all_aircraft_type_idxs.append(aircraft_type_idx.cpu())
 
             if is_eval:
                 y_true_rate = torch.expm1(y_log)
@@ -492,6 +528,7 @@ def _run_inference(
     preds_rate_tensor = torch.cat(all_preds_rate).flatten()
     segment_ids_tensor = torch.cat(all_segment_ids).flatten()
     durations_tensor = torch.cat(all_durations).flatten()
+    aircraft_type_idx_tensor = torch.cat(all_aircraft_type_idxs).flatten()
 
     if is_eval:
         trues_rate_tensor = torch.cat(all_trues_rate).flatten()
@@ -501,6 +538,7 @@ def _run_inference(
                 "duration_s": durations_tensor.numpy(),
                 "y_true_rate": trues_rate_tensor.numpy(),
                 "y_pred_rate": preds_rate_tensor.to(torch.float32).numpy(),
+                "aircraft_type_idx": aircraft_type_idx_tensor.numpy(),
             }
         )
         df = df.with_columns(
