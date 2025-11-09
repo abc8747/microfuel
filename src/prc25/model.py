@@ -62,6 +62,36 @@ class LinearAttentionBlock(nn.Module):
         return x
 
 
+class StaticHyperNet(nn.Module):
+    """Creates a specialised feature extractor for each aircraft type, improving over
+    feature conditioning (concatenating embeddings to input).
+
+    See: https://arxiv.org/pdf/1609.09106#page=3 (Section 3.1)."""
+
+    def __init__(
+        self, num_aircraft_types: int, embedding_dim: int, input_dim: int, output_dim: int
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.embedding = nn.Embedding(num_aircraft_types, embedding_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embedding_dim, 64),
+            nn.GELU(),
+            nn.Linear(64, (input_dim * output_dim) + output_dim),
+        )
+
+    def forward(
+        self, aircraft_type_idx: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        embeddings = self.embedding(aircraft_type_idx)
+        params = self.mlp(embeddings)
+        weights_flat = params[:, : self.input_dim * self.output_dim]
+        bias = params[:, self.input_dim * self.output_dim :]
+        weights = weights_flat.view(-1, self.output_dim, self.input_dim)
+        return weights, bias, embeddings
+
+
 @dataclass
 class FuelBurnPredictorConfig:
     input_dim: int
@@ -100,8 +130,12 @@ class FuelBurnPredictor(nn.Module):
         )
         head_dim = key_dim // cfg.num_heads
 
-        self.aircraft_embedding = nn.Embedding(cfg.num_aircraft_types, cfg.aircraft_embedding_dim)
-        self.input_proj = nn.Linear(cfg.input_dim + cfg.aircraft_embedding_dim, cfg.hidden_size)
+        self.hypernetwork = StaticHyperNet(
+            num_aircraft_types=cfg.num_aircraft_types,
+            embedding_dim=cfg.aircraft_embedding_dim,
+            input_dim=cfg.input_dim,
+            output_dim=cfg.hidden_size,
+        )
         self.layers = nn.ModuleList(
             [
                 LinearAttentionBlock(cfg.hidden_size, cfg.num_heads, head_dim)
@@ -109,7 +143,7 @@ class FuelBurnPredictor(nn.Module):
             ]
         )
         self.pooler = Pooler(mode=cfg.pooler_mode)
-        self.regression_head = nn.Linear(cfg.hidden_size, 1)
+        self.regression_head = nn.Linear(cfg.hidden_size + cfg.aircraft_embedding_dim, 1)
 
     def forward(
         self,
@@ -124,15 +158,14 @@ class FuelBurnPredictor(nn.Module):
         # this is a temporary step before using full flight context.
         segment_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
 
-        ac_embeddings = self.aircraft_embedding(aircraft_type_idx)
-        ac_embeddings_repeated = torch.repeat_interleave(ac_embeddings, segment_lengths, dim=0)
-
-        x = torch.cat([x, ac_embeddings_repeated], dim=1)
-        x = self.input_proj(x)
+        weights, bias, ac_embeddings = self.hypernetwork(aircraft_type_idx)
+        weights_expanded = torch.repeat_interleave(weights, segment_lengths, dim=0)
+        bias_expanded = torch.repeat_interleave(bias, segment_lengths, dim=0)
+        x = torch.bmm(weights_expanded, x.unsqueeze(-1)).squeeze(-1) + bias_expanded
 
         for layer in self.layers:
             x = layer(x, cu_seqlens)
 
         pooled_x = self.pooler(x, cu_seqlens)
-        y_pred = self.regression_head(pooled_x)
+        y_pred = self.regression_head(torch.cat([pooled_x, ac_embeddings], dim=1))
         return y_pred

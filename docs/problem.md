@@ -59,17 +59,16 @@ For simplicity, we only use trajectory information within the prediction interva
 
 To handle noisy and missing data, we apply a constant-velocity Kalman filter and RTS smoother to the time series of altitude, vertical rate, and ground speed. For ground speed and track, we first decompose them into East-West ($v_{ew}$) and North-South ($v_{ns}$) velocity components and apply the smoother to each component separately before recombining them. This provides smoother estimates, particularly helpful for shorter segments.
 
-### Input Features
+### Input Features & Hypernetwork
 
-The input vector at each time step $i$ is a concatenation of standardised observations $o_i$, temporal features, and a learned aircraft type embedding:
+To better handle the long-tailed aircraft type distribution, we use parameter conditioning via a hypernetwork.
 
-$$
-x_i = [o_i, t_i - t_0, t_f - t_i, \text{Embedding}(\text{aircraft\_type})]
-$$
-
-- $o_i$: Standardised observations from the preprocessed trajectory, including altitude, groundspeed, and vertical rate.
-- $t_0$, $t_f$: takeoff and arrival time.
-- aircraft type: a categorical feature drawn from a long-tailed distribution
+1. an aircraft type embedding, $e_{\text{ac}}$, is generated for each aircraft.
+2. this embedding is passed through a small mlp (the hypernetwork) to generate the weights $W_{\text{proj}}$ and bias $b_{\text{proj}}$ of a unique input projection layer for that specific aircraft type.
+3. the input vector at each time step, $o_i$, consisting of standardised observations and temporal features, is then projected into the model's hidden space:
+    $$
+    h_i = W_{\text{proj}} o_i + b_{\text{proj}}
+    $$
 
 Several other features were experimented with but did not improve performance, including time gaps between observations ($\Delta t_i$), `time2vec` embeddings, and physics-informed features like $\frac{T - D}{m} = \underbrace{\frac{dV}{dt} + g \frac{dh}{dt}}_{\text{Specific Energy Rate}} + \text{wind effect}$ and a $\frac{C_L S}{m} = \frac{g\cos\gamma}{\frac{1}{2}\rho V^2 \cos\phi}$. Noisy sequences are usually the culprit (e.g. $\dot{V}$, $\ddot{h}$)
 
@@ -81,7 +80,7 @@ $$
 y = \log\left(\frac{\text{fuel\_kg}}{t_{\text{end}} - t_{\text{start}}} + 1\right)
 $$
 
-The final prediction is pooled from the last token of the GDN output. This simplifies the problem to a sequence-to-scalar regression task, avoiding the need to directly integrate the instantaneous burn rate $\dot{m}_f(t)$.
+The sequence output from the gdn is pooled (e.g., using the last token). this pooled vector is then concatenated with the original aircraft type embedding, $e_{\text{ac}}$, before being passed to the final linear regression head. the concatentation is essential for aircraft with large fuel burn (a388).
 
 ### Results
 
@@ -98,9 +97,13 @@ Finetuning with a loss function that directly weights by segment duration (`rmse
 
 ^ this incorrectly refers to seed 13 of train/validation split constructed from random sampling. more runs reveal RMSE of between 200-350.
 
-<!-- v0.0.6: introduced warmup and gradient clipping to stabilise training.
+<!--
+v0.0.6: introduced warmup and gradient clipping to stabilise training.
 v0.0.7: used stratified sampling (by ac type) and CB loss
-v0.0.8: used stratified sampling (by ac type & by duration quantile) -->
+v0.0.8: used stratified sampling (by ac type & by duration quantile)
+v0.0.9: switched to hypernetworks, seed 24 RMSE: 228.2 -> 212.68
+v0.0.9+dev1: concat aircraft type embedding to final layer, seed 24 RMSE: 212.68 -> 208.58
+-->
 
 ### Class Imbalance
 
@@ -147,4 +150,4 @@ misc
 - `fuel_burn` is quantised (see [data](./data.md)): also predict absolute uncertainty, but is this really needed? (gaussian_nll_loss probably isn't relevant)
 - staged training: train on short sequences first -> longer sequences
 - multilayer -> stochastic depth / layerscale
-- improve input projection.
+- hyper networks for fast weights and/or components of gdn.
