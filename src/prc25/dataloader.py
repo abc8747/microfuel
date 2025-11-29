@@ -29,14 +29,24 @@ SequenceInfo = namedtuple(
 )
 Sequence = namedtuple(
     "Sequence",
-    ["features", "target", "segment_id", "aircraft_type_idx", "duration_s", "flight_id"],
+    [
+        "features_flight",
+        "features_segment",
+        "target",
+        "segment_id",
+        "aircraft_type_idx",
+        "duration_s",
+        "flight_id",
+    ],
 )
 VarlenBatch = namedtuple(
     "VarlenBatch",
     [
-        "x",
+        "x_flight",
+        "cu_seqlens_flight",
+        "x_segment",
+        "cu_seqlens_segment",
         "y",
-        "cu_seqlens",
         "segment_ids",
         "aircraft_type_idx",
         "durations",
@@ -198,13 +208,15 @@ class VarlenDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Sequence:
         seq_info = self.sequences[idx]
-        flight_start_abs, _ = seq_info.flight_indices
+        flight_start_abs, flight_end_abs = seq_info.flight_indices
         segment_start_rel, segment_end_rel = seq_info.segment_indices_relative
-        segment_start_abs = flight_start_abs + segment_start_rel
-        segment_end_abs = flight_start_abs + segment_end_rel
-        features = self.all_features[segment_start_abs:segment_end_abs]
+
+        features_flight = self.all_features[flight_start_abs:flight_end_abs]
+        features_segment = features_flight[segment_start_rel:segment_end_rel]
+
         return Sequence(
-            features=features,
+            features_flight=features_flight,
+            features_segment=features_segment,
             target=seq_info.target,
             segment_id=seq_info.segment_id,
             aircraft_type_idx=seq_info.aircraft_type_idx,
@@ -214,11 +226,16 @@ class VarlenDataset(Dataset):
 
 
 def collate_fn(batch_sequences: list[Sequence]) -> VarlenBatch:
-    lengths = [len(seq.features) for seq in batch_sequences]
+    lengths_flight = [len(seq.features_flight) for seq in batch_sequences]
+    lengths_segment = [len(seq.features_segment) for seq in batch_sequences]
 
-    x = torch.cat([seq.features for seq in batch_sequences], dim=0)
+    x_flight = torch.cat([seq.features_flight for seq in batch_sequences], dim=0)
+    x_segment = torch.cat([seq.features_segment for seq in batch_sequences], dim=0)
     y = torch.tensor([seq.target for seq in batch_sequences], dtype=torch.float32).unsqueeze(1)
-    cu_seqlens = torch.from_numpy(np.cumsum([0, *lengths], dtype=np.int32))
+
+    cu_seqlens_flight = torch.from_numpy(np.cumsum([0, *lengths_flight], dtype=np.int32))
+    cu_seqlens_segment = torch.from_numpy(np.cumsum([0, *lengths_segment], dtype=np.int32))
+
     segment_ids = torch.tensor([seq.segment_id for seq in batch_sequences], dtype=torch.int32)
     aircraft_type_idx = torch.tensor(
         [seq.aircraft_type_idx for seq in batch_sequences], dtype=torch.long
@@ -226,9 +243,11 @@ def collate_fn(batch_sequences: list[Sequence]) -> VarlenBatch:
     durations = torch.tensor([seq.duration_s for seq in batch_sequences], dtype=torch.float32)
 
     return VarlenBatch(
-        x=x,
+        x_flight=x_flight,
+        cu_seqlens_flight=cu_seqlens_flight,
+        x_segment=x_segment,
+        cu_seqlens_segment=cu_seqlens_segment,
         y=y,
-        cu_seqlens=cu_seqlens,
         segment_ids=segment_ids,
         aircraft_type_idx=aircraft_type_idx,
         durations=durations,

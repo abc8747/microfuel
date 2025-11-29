@@ -329,9 +329,11 @@ def train(
                 f"Epoch {epoch + 1}/{cfg.epochs}", total=len(train_dataloader)
             )
             for data in train_dataloader:
-                x: torch.Tensor = data.x.to(device)
+                x_flight: torch.Tensor = data.x_flight.to(device)
+                cu_seqlens_flight: torch.Tensor = data.cu_seqlens_flight.to(device)
+                x_segment: torch.Tensor = data.x_segment.to(device)
+                cu_seqlens_segment: torch.Tensor = data.cu_seqlens_segment.to(device)
                 y_log: torch.Tensor = data.y.to(device)
-                cu_seqlens: torch.Tensor = data.cu_seqlens.to(device)
                 aircraft_type_idx: torch.Tensor = data.aircraft_type_idx.to(device)
                 durations: torch.Tensor = data.durations.to(device)
 
@@ -340,7 +342,13 @@ def train(
                 with torch.autocast(
                     device_type=device, dtype=torch.bfloat16, enabled=(device == "cuda")
                 ):
-                    y_pred_log = model(x, cu_seqlens, aircraft_type_idx)
+                    y_pred_log = model(
+                        x_flight,
+                        cu_seqlens_flight,
+                        x_segment,
+                        cu_seqlens_segment,
+                        aircraft_type_idx,
+                    )
                     loss_per_sample = criterion(y_pred_log, y_log)
 
                     if weights is not None:
@@ -498,10 +506,21 @@ def _run_inference(
     with torch.no_grad():
         task = progress.add_task(description, total=len(dataloader))
         for data in dataloader:
-            x, y_log, cu_seqlens, segment_ids, aircraft_type_idx, durations = (
-                data.x.to(device),
+            (
+                x_flight,
+                cu_seqlens_flight,
+                x_segment,
+                cu_seqlens_segment,
+                y_log,
+                segment_ids,
+                aircraft_type_idx,
+                durations,
+            ) = (
+                data.x_flight.to(device),
+                data.cu_seqlens_flight.to(device),
+                data.x_segment.to(device),
+                data.cu_seqlens_segment.to(device),
                 data.y.to(device),
-                data.cu_seqlens.to(device),
                 data.segment_ids.cpu(),
                 data.aircraft_type_idx.to(device),
                 data.durations.cpu(),
@@ -509,7 +528,13 @@ def _run_inference(
             with torch.autocast(
                 device_type=device, dtype=torch.bfloat16, enabled=(device == "cuda")
             ):
-                y_pred_log = model(x, cu_seqlens, aircraft_type_idx)
+                y_pred_log = model(
+                    x_flight,
+                    cu_seqlens_flight,
+                    x_segment,
+                    cu_seqlens_segment,
+                    aircraft_type_idx,
+                )
 
             y_pred_rate = torch.expm1(y_pred_log)
             all_preds_rate.append(y_pred_rate.cpu())

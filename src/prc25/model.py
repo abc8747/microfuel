@@ -111,10 +111,10 @@ class FuelBurnPredictor(nn.Module):
         - [start, end]: the segment for which we predict fuel burn
         - [end, arrival]
 
-    This model only processes the [start, end] segment.
+    This model processes the [start, end] segment and the full [takeoff, arrival] flight.
 
-    Instead of padding, segments are tightly packed together in a long tensor, and
-    FLA is informed of segment boundaries via the `cu_seqlens` tensor.
+    Instead of padding, sequences are tightly packed together in a long tensor, and
+    FLA is informed of boundaries via the `cu_seqlens` tensor.
     """
 
     def __init__(self, cfg: FuelBurnPredictorConfig):
@@ -130,42 +130,79 @@ class FuelBurnPredictor(nn.Module):
         )
         head_dim = key_dim // cfg.num_heads
 
-        self.hypernetwork = StaticHyperNet(
+        # segment processing branch
+        self.hypernetwork_segment = StaticHyperNet(
             num_aircraft_types=cfg.num_aircraft_types,
             embedding_dim=cfg.aircraft_embedding_dim,
             input_dim=cfg.input_dim,
             output_dim=cfg.hidden_size,
         )
-        self.layers = nn.ModuleList(
+        self.layers_segment = nn.ModuleList(
             [
                 LinearAttentionBlock(cfg.hidden_size, cfg.num_heads, head_dim)
                 for _ in range(cfg.num_layers)
             ]
         )
-        self.pooler = Pooler(mode=cfg.pooler_mode)
-        self.regression_head = nn.Linear(cfg.hidden_size + cfg.aircraft_embedding_dim, 1)
+        self.pooler_segment = Pooler(mode=cfg.pooler_mode)
+
+        # flight context processing branch
+        self.hypernetwork_flight = StaticHyperNet(
+            num_aircraft_types=cfg.num_aircraft_types,
+            embedding_dim=cfg.aircraft_embedding_dim,
+            input_dim=cfg.input_dim,
+            output_dim=cfg.hidden_size,
+        )
+        self.layers_flight = nn.ModuleList(
+            [
+                LinearAttentionBlock(cfg.hidden_size, cfg.num_heads, head_dim)
+                for _ in range(cfg.num_layers)
+            ]
+        )
+        self.pooler_flight = Pooler(mode=cfg.pooler_mode)
+
+        # share embedding layer between hypernetworks
+        self.hypernetwork_flight.embedding = self.hypernetwork_segment.embedding
+
+        self.regression_head = nn.Linear(
+            cfg.hidden_size + cfg.hidden_size + cfg.aircraft_embedding_dim, 1
+        )
 
     def forward(
         self,
-        x: torch.Tensor,
-        cu_seqlens: torch.Tensor,
+        x_flight: torch.Tensor,
+        cu_seqlens_flight: torch.Tensor,
+        x_segment: torch.Tensor,
+        cu_seqlens_segment: torch.Tensor,
         aircraft_type_idx: torch.Tensor,
     ) -> torch.Tensor:
-        """:param x: Packed tensor of trajectory segments
-        :param cu_seqlens: Cumulative sequence lengths for packed tensor
+        """:param x_flight: packed tensor of full flight trajectories
+        :param cu_seqlens_flight: cumulative sequence lengths for flight tensor
+        :param x_segment: packed tensor of trajectory segments for prediction
+        :param cu_seqlens_segment: cumulative sequence lengths for segment tensor
         :param aircraft_type_idx: (B,) tensor of aircraft type indices"""
-        # for now, we only operate on the [start, end] segments.
-        # this is a temporary step before using full flight context.
-        segment_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        # segment processing
+        segment_lengths = cu_seqlens_segment[1:] - cu_seqlens_segment[:-1]
+        weights_s, bias_s, ac_embeddings = self.hypernetwork_segment(aircraft_type_idx)
+        weights_expanded_s = torch.repeat_interleave(weights_s, segment_lengths, dim=0)
+        bias_expanded_s = torch.repeat_interleave(bias_s, segment_lengths, dim=0)
+        x_s = torch.bmm(weights_expanded_s, x_segment.unsqueeze(-1)).squeeze(-1) + bias_expanded_s
 
-        weights, bias, ac_embeddings = self.hypernetwork(aircraft_type_idx)
-        weights_expanded = torch.repeat_interleave(weights, segment_lengths, dim=0)
-        bias_expanded = torch.repeat_interleave(bias, segment_lengths, dim=0)
-        x = torch.bmm(weights_expanded, x.unsqueeze(-1)).squeeze(-1) + bias_expanded
+        for layer in self.layers_segment:
+            x_s = layer(x_s, cu_seqlens_segment)
+        pooled_segment = self.pooler_segment(x_s, cu_seqlens_segment)
 
-        for layer in self.layers:
-            x = layer(x, cu_seqlens)
+        # flight context processing
+        flight_lengths = cu_seqlens_flight[1:] - cu_seqlens_flight[:-1]
+        weights_f, bias_f, _ = self.hypernetwork_flight(aircraft_type_idx)
+        weights_expanded_f = torch.repeat_interleave(weights_f, flight_lengths, dim=0)
+        bias_expanded_f = torch.repeat_interleave(bias_f, flight_lengths, dim=0)
+        x_f = torch.bmm(weights_expanded_f, x_flight.unsqueeze(-1)).squeeze(-1) + bias_expanded_f
 
-        pooled_x = self.pooler(x, cu_seqlens)
-        y_pred = self.regression_head(torch.cat([pooled_x, ac_embeddings], dim=1))
+        for layer in self.layers_flight:
+            x_f = layer(x_f, cu_seqlens_flight)
+        pooled_flight = self.pooler_flight(x_f, cu_seqlens_flight)
+
+        # final regression
+        combined_features = torch.cat([pooled_segment, pooled_flight, ac_embeddings], dim=1)
+        y_pred = self.regression_head(combined_features)
         return y_pred
