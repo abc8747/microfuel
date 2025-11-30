@@ -1,153 +1,57 @@
 # Data
 
+Summary statistics:
+
+| Dataset Partition | Trajectory Rows | Fuel Segments | Flights | File Size |
+| :---------------- | :-------------- | :------------ | :------ | :-------- |
+| Phase 1 (Train)   | 124,094,050     | 133,984       | 11,088  | 3.2 GB    |
+| Phase 1 (Rank)    | 24,499,924      | 24,972        | 1,929   | 616 MB    |
+| Phase 2 (Rank)    | 37,877,494      | 61,745        | 2,839   | 943 MB    |
+
 ## First party data
 
-Directly from the S3 bucket. For consistency:
+Schema:
 
-```sh
-mv flightlist_train.parquet flight_list_phase1.parquet
-mv fuel_train.parquet fuel_phase1.parquet
-mv flights_train flights_phase1 
+- [Fuel][microfuel.datasets.raw.FuelRecord]
+- [Flight List][microfuel.datasets.raw.FlightListRecord]
+- [Trajectories][microfuel.datasets.raw.TrajectoryRecord]
+- [Airports][microfuel.datasets.raw.AirportRecord]
 
-mv flightlist_rank.parquet flight_list_phase1_rank.parquet
-mv fuel_rank_submission.parquet fuel_phase1_rank.parquet
-mv flights_rank flights_phase1_rank
+The distribution of aircraft type, segment lengths are heavily tailed.
 
-mv flightlist_final.parquet flight_list_phase2_rank.parquet
-mv fuel_train.parquet fuel_phase2_rank.parquet
-mv flights_final flights_phase2_rank
-```
+![image](assets/segment_distributions.png)
 
-### 1. Fuel Data (`fuel_*.parquet`)
+A visualisation of the fuel burn in a simple altitude/speed plot.
 
-133,984 rows (phase 1 train)
+![image](assets/speed_alt_fuel_burn.png)
 
-24,972 rows (phase 1 rank)
-
-61,745 rows (phase 2 rank)
-
-| Column      | Units | Type                    | Description                                                    |
-| ----------- | ----- | ----------------------- | -------------------------------------------------------------- |
-| `idx`       | -     | INTEGER                 | Unique row identifier                                          |
-| `flight_id` | -     | VARCHAR                 | Links to the flight list and trajectory                        |
-| `start`     | UTC   | TIMESTAMP WITH TIMEZONE | The start timestamp of the interval                            |
-| `end`       | UTC   | TIMESTAMP WITH TIMEZONE | The end timestamp of the interval                              |
-| `fuel_kg`   | kg    | DOUBLE                  | The target variable. In submission files, this is set to `0.0` |
+### Weather Data
 
 !!! note
-    The `start` and `end` often correspond to the timestamps of ACARS reports.
+    Weather data is unused in `v0.1` versions of the models.
+    Future versions of the model (`v0.2` onwards) will allow optionally specifying the wind component for more accurate predictions.
 
-!!! warning
-    `fuel_kg` target variable has quantisation artifacts: data is not a simple continuous distribution but a composite from at least two distinct sources: imperial (pounds) and metric (kilograms) units with a 2sf rounding step.
+We augment the trajectory data with `u` and `v` wind components extracted from the [ARCO ERA5](https://github.com/google-research/arco-era5) dataset. This requires installing `microfuel` with the `era5` optional depedency.
 
-### 2. Flight List (`flight_list_*.parquet`)
-
-124,094,050 total rows (phase 1 train, 11088 files, 3.2G)
-
-24,499,924 total rows (phase 1 rank, 1929 files, 616M)
-
-37,877,494 total rows (phase 2 rank, 2839 files, 943M)
-
-| Column             | Units | Type      | Description                           |
-| ------------------ | ----- | --------- | ------------------------------------- |
-| `flight_id`        | -     | VARCHAR   | A unique identifier for the flight    |
-| `flight_date`      | -     | DATE      | The date of the flight                |
-| `takeoff`          | UTC   | TIMESTAMP | The timestamp of takeoff              |
-| `landed`           | UTC   | TIMESTAMP | The timestamp of landing              |
-| `origin_icao`      | -     | VARCHAR   | ICAO code for the departure airport   |
-| `origin_name`      | -     | VARCHAR   | Name of the departure airport         |
-| `destination_icao` | -     | VARCHAR   | ICAO code for the destination airport |
-| `destination_name` | -     | VARCHAR   | Name of the destination airport       |
-| `aircraft_type`    | -     | VARCHAR   | ICAO code for the aircraft model      |
-
-### 3. Trajectories (`flights_*/<flight_id>.parquet`)
-
-Time-series state vectors for each flight: trajectories may be incomplete and contain anomalies.
-
-| Column          | Units   | Type         | Description                                      |
-| --------------- | ------- | ------------ | ------------------------------------------------ |
-| `timestamp`     | UTC     | TIMESTAMP_NS | Timestamp of the position report                 |
-| `flight_id`     | -       | VARCHAR      | Links to the flight list and fuel data           |
-| `typecode`      | -       | VARCHAR      | Aircraft type code                               |
-| `latitude`      | degrees | DOUBLE       | Position latitude in decimal degrees             |
-| `longitude`     | degrees | DOUBLE       | Position longitude in decimal degrees            |
-| `altitude`      | ft      | DOUBLE       | Altitude                                         |
-| `groundspeed`   | knots   | DOUBLE       | Ground speed                                     |
-| `track`         | degrees | DOUBLE       | Track angle                                      |
-| `vertical_rate` | ft/min  | DOUBLE       | Rate of climb/descent                            |
-| `mach`          | -       | DOUBLE       | Mach number (may be NULL)                        |
-| `TAS`           | knots   | DOUBLE       | True airspeed (may be NULL)                      |
-| `CAS`           | knots   | DOUBLE       | Calibrated airspeed (may be NULL)                |
-| `source`        | -       | VARCHAR      | The origin of the data, either `adsb` or `acars` |
-
-!!! tip "A Note on `source`"
-    Data from `adsb` and `acars` have different characteristics. `acars` data, for instance, may include `mach`, `TAS`, and `CAS`, which are not present in standard ADS-B reports.
-
-### 4. Airports (`apt.parquet`)
-
-8787 rows
-
-| Column      | Units   | Type    | Description                            |
-| ----------- | ------- | ------- | -------------------------------------- |
-| `icao`      | -       | VARCHAR | ICAO code of the airport (e.g. `VHHH`) |
-| `latitude`  | degrees | DOUBLE  | Airport latitude coordinate            |
-| `longitude` | degrees | DOUBLE  | Airport longitude coordinate           |
-| `elevation` | ft      | DOUBLE  | Airport elevation (may be NULL)        |
-
-### 5. Weather Data (ERA5)
-
-We augment the trajectory data with U and V wind components extracted from the [ARCO ERA5](https://github.com/google-research/arco-era5) dataset.
-
-Please install the package with the `era5` optional dependency.
-
-1. The raw weather data is massive, we recommend a using an extenral HDD and symlink to `data/raw/weather`:
+1. The weather data is massive (~565 GB). It is recommended to use an extenral HDD and symlink it to `data/raw/weather`:
 
     ```sh
-    mkdir -p /mnt/hdd/prc25_era5
-    ln -s /mnt/hdd/prc25_era5 data/raw/era5
+    mkdir -p /mnt/hdd/microfuel_era5
+    ln -s /mnt/hdd/microfuel_era5 data/raw/era5
     ```
 
-2. We use `gcloud` to pull specific pressure level slices (NetCDF).
+2. Install the [`gcloud` CLI](https://cloud.google.com/sdk/docs/install-sdk) and run the following to pull specific pressure level slices in NetCDF format.
 
     ```sh
-    # Requires google-cloud-sdk installed
     uv run scripts/main.py download-era5
     ```
 
-    Months: April - October 2025.
-    Variables: `u_component_of_wind`, `v_component_of_wind`
-    Levels: 28 levels from 1000 hPa to 70 hPa
-    Size: 565G
+    - Months: `2025-04`..=`2025-10`
+    - Variables: `u_component_of_wind`, `v_component_of_wind`
+    - Levels: 28 levels (1000..=70 hPa)
 
-3. We interpolate the 4D weather grid (time, level, lat, lon) onto the 4D flight trajectory coordinates.
+3. We interpolate the 4D weather grid (`time`, `level`, `lat`, `lon`) onto the 4D flight trajectory coordinates.
 
     ```sh
     uv run scripts/main.py create-era5 --partition phase1
     ```
-
-## Submission Format
-
-Final predictions must be submitted as a single Parquet file.
-
-### File Format
-
-The submission file must contain the exact same entries as the provided `fuel_rank_submission.parquet` or `fuel_final_submission.parquet` file, with the `fuel_kg` column populated with the predictions.
-
-The file must contain two columns:
-
-- `idx`: The row identifier, matching the submission template.
-- `fuel_kg`: Predicted fuel consumption (kilograms) for the given interval.
-
-example:
-
-```text
-idx   flight_id     start                end                  fuel_kg
----   -----------   -----                ---                  -------
-0     prc770822360  2025-04-13 04:31:04  2025-04-13 05:01:04  250.3
-1     prc770822360  2025-04-13 05:01:04  2025-04-13 05:16:04  120.8
-2     prc770822360  2025-04-13 05:16:04  2025-04-13 05:46:04  2500.0
-...   ...           ...                   ...                 ...
-```
-
-!!! important "Missing Rows"
-    Only the `idx` and `fuel_kg` columns are used for scoring. If the submission is missing rows that are present in the template, they will be assigned a value of `0.0`, which may negatively impact your RMSE score.

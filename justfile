@@ -11,6 +11,6 @@ train:
         uv run scripts/main.py create-splits phase1 --seed $seed
         for beta in 0.99; do
             # uv run scripts/main.py evaluate data/checkpoints/gdn-all_ac-v0.0.12+seed${seed}+cb${beta}+dev3/best.pt
-            uv run scripts/main.py train --exp-name gdn-all_ac-v0.0.12+seed${seed}+cb${beta}+dev3 --beta ${beta}
+            uv run scripts/main.py train --exp-name gdn-all_ac-v0.0.12+seed${seed}+cb${beta}+dev4 --beta ${beta}
         done
     done

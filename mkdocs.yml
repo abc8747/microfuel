@@ -1,12 +1,14 @@
-site_name: prc25
+site_name: microfuel
 site_description: An open machine learning model to infer the fuel consumed of a flown flight.
-repo_name: abc8747/prc25
-repo_url: https://github.com/abc8747/prc25
-site_url: https://abc8747.github.io/prc25/
+repo_name: abc8747/microfuel
+repo_url: https://github.com/abc8747/microfuel
+site_url: https://abc8747.github.io/microfuel/
 nav:
-  - Quickstart: "README.md"
+  - Home: "README.md"
+  - Quickstart: "quickstart.md"
   - Data: "data.md"
   - Problem: "problem.md"
+  - API Reference: "api.md"
 
 theme:
   name: material
@@ -38,6 +40,7 @@ plugins:
             - https://numpy.org/doc/stable/objects.inv
             - https://pola-rs.github.io/polars/py-polars/html/objects.inv # unstable, see https://github.com/pola-rs/polars/issues/7027
             - https://einops.rocks/objects.inv
+            - https://abc8747.github.io/isqx/objects.inv
           options:
             # member
             inherited_members: true
@@ -45,6 +48,7 @@ plugins:
             # signature
             separate_signature: true
             show_signature_annotations: true
+            annotations_path: source
             # docstring
             docstring_style: sphinx
             docstring_section_style: table

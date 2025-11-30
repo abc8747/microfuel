@@ -6,7 +6,7 @@ import logging
 import multiprocessing
 import traceback
 from collections import namedtuple
-from datetime import timedelta
+from datetime import timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, TypedDict, get_args
 
@@ -21,6 +21,7 @@ from .. import (
     Coordinate2D,
     Partition,
     Split,
+    deg2rad,
     fpm2mps,
     ft2m,
     knot2mps,
@@ -40,12 +41,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-StateFeature = Literal[
+CoreFeature = Literal[
     "altitude",
     "groundspeed",
     "vertical_rate",
-    # "track_rate",
+    # "track_rate"
 ]
+# NOTE: weather data is not used and reserved for future use.
+# WeatherFeature = Literal[
+#     "wind_dot_ground",
+#     # "true_airspeed"
+# ]
+# WEATHER_FEATURES = get_args(WeatherFeature)
+WEATHER_FEATURES = []
+StateFeature = Literal[CoreFeature]
 STATE_FEATURES = get_args(StateFeature)
 FlightFeature = Literal["flight_progress", "flight_duration"]
 FLIGHT_FEATURES = get_args(FlightFeature)
@@ -298,7 +307,9 @@ def smooth_time_series(
 ) -> SmoothResult:
     """Applies a Kalman filter and RTS smoother to a 1D time series, handling large gaps.
 
-    Assumes a constant-velocity model.
+    Assumes the time series follow a Constant Velocity (CV) system:
+    $x_k = F x_{k-1} + w_k$.
+
     :param process_noise_variances: (pos, vel) variances for the model's state transition noise (Q).
     :param observation_noise_variance: variance for the measurement noise (R).
     :param gap_threshold: time gap (in seconds) above which to split the time series into chunks.
@@ -383,6 +394,14 @@ def make_trajectories(
 ):
     """Creates train/validation split of preprocessed trajectories.
 
+    Handles the alignment of asynchronous data sources:
+    1. Flight List: [takeoff, landing] constraints.
+    2. Fuel Data: segment boundaries.
+    3. ADS-B + ACARS: raw state observations.
+
+    It produces the standard state vector $x_t$ required by
+    [`microfuel.model.FuelBurnPredictor`][].
+
     Everything related to segments (e.g. whether a particular state vector is within [start, end])
     should be handled elsewhere. This function processes the *entire* trajectory.
     """
@@ -420,7 +439,9 @@ def make_trajectories(
 
     trajectories_all: list[pl.LazyFrame] = []
     for i, flight_id in enumerate(track(flight_ids_with_fuel, description="processing flights")):
-        traj_lf = raw.scan_trajectory(flight_id, partition)
+        traj_lf = raw.scan_trajectory(flight_id, partition).with_columns(
+            pl.col("timestamp").dt.replace_time_zone("UTC")
+        )  # raw file has naiive timestamps, cast early to avoid issues in era5 interpolation
         flight = flight_id_to_flight[flight_id]
         timestamp_takeoff = flight["takeoff"]
         timestamp_landed = flight["landed"]
@@ -442,7 +463,7 @@ def make_trajectories(
             .sort()
         )
 
-        traj_df = traj_lf.collect()
+        traj_df = traj_lf.unique(subset=["timestamp"], keep="first").sort("timestamp").collect()
         timestamps_existing = traj_df.select("timestamp").to_series()
         # takeoff time in flight list usually precedes the first timestamp in trajectory data
         timestamps_missing = timestamps_required.filter(
@@ -764,7 +785,7 @@ def make_era5(
             "altitude",
         )
         .with_columns(
-            date_key=pl.col("timestamp").dt.date(),
+            date_key=pl.col("timestamp").dt.convert_time_zone("UTC").dt.date(),
             pressure_level=altitude_to_pressure_std(pl.col("altitude")),
             longitude_era5=(pl.col("longitude") + 360) % 360,
         )
@@ -809,7 +830,11 @@ def make_era5(
             da_loaded = da_sliced.load()
             ds.close()
 
-            # "fill_value": None enables extrapolation in scipy's RegularGridInterpolator
+            # NOTE: fill_value enables extrapolation.
+            # consider a point at 23:55,
+            # we would need 23:00 and 00:00 (the latter is located in a
+            # different file) to interpolate. however, we cannot afford spending
+            # 2x RAM, so we just have to deal with it for now.
             interp_res = da_loaded.interp(
                 time=targets["time"],
                 latitude=targets["latitude"],
@@ -862,8 +887,12 @@ def make_era5(
             "level": target_level,
         }
 
-        min_time = batch["timestamp"].min().replace(tzinfo=None) - timedelta(hours=2)  # type: ignore
-        max_time = batch["timestamp"].max().replace(tzinfo=None) + timedelta(hours=2)  # type: ignore
+        min_time = batch["timestamp"].min().astimezone(timezone.utc).replace(  # type: ignore
+            tzinfo=None
+        ) - timedelta(hours=2)
+        max_time = batch["timestamp"].max().astimezone(timezone.utc).replace(  # type: ignore
+            tzinfo=None
+        ) + timedelta(hours=2)
 
         u_values = _process_variable(
             day_path / "u_component_of_wind",
@@ -899,6 +928,49 @@ def make_era5(
         gc.collect()
 
     logger.info(f"wrote daily weather chunks to {path_out_dir}")
+
+
+def make_derived_features(partition: Partition, *, path_base: Path = PATH_PREPROCESSED):
+    """
+    !!! warning
+        This function is unused. Integration of weather features is planned for the future
+    """
+    traj_lf = (
+        pl.scan_parquet(path_base / f"trajectories_{partition}.parquet")
+        .select("flight_id", "timestamp", "groundspeed", "track")
+        .with_row_index("row_idx")
+    )
+    weather_lf = (
+        pl.scan_parquet(path_base / f"weather_{partition}/*.parquet")
+        .select("flight_id", "timestamp", "u_wind", "v_wind")
+        .unique(subset=["flight_id", "timestamp"])
+    )
+
+    ve = pl.col("groundspeed") * (deg2rad(pl.col("track"))).sin()
+    vn = pl.col("groundspeed") * (deg2rad(pl.col("track"))).cos()
+
+    u, v = pl.col("u_wind"), pl.col("v_wind")
+
+    va_e = ve - u
+    va_n = vn - v
+
+    tas = (va_e.pow(2) + va_n.pow(2)).sqrt()
+    wind_dot = ve * u + vn * v
+
+    derived_lf = (
+        traj_lf.join(weather_lf, on=["flight_id", "timestamp"], how="left")
+        .sort("row_idx")
+        .select(
+            "flight_id",
+            "timestamp",
+            tas.alias("true_airspeed"),
+            wind_dot.alias("wind_dot_ground"),
+        )
+    )
+
+    path_out = path_base / f"derived_{partition}.parquet"
+    derived_lf.sink_parquet(path_out)
+    logger.info(f"wrote derived features to {path_out}")
 
 
 #
@@ -1043,7 +1115,15 @@ def prepare_iterator_data(
         .collect()
     )
 
-    traj_lf = pl.scan_parquet(path_base / f"trajectories_{partition}.parquet")
+    # optimisation: select specific columns early to avoid OOM during large joins
+    traj_cols = ["flight_id", "timestamp", *CORE_FEATURES]
+    traj_lf = pl.scan_parquet(path_base / f"trajectories_{partition}.parquet").select(traj_cols)
+    derived_path = path_base / f"derived_{partition}.parquet"
+    if derived_path.exists() and WEATHER_FEATURES:
+        derived_lf = pl.scan_parquet(derived_path)
+        traj_lf = pl.concat(
+            [traj_lf, derived_lf.select(WEATHER_FEATURES)], how="horizontal"
+        )  # NOTE: we do not do a join here to avoid OOM: we already made sure rows align perfectly
 
     if stats is not None:
         standardisation_exprs = [

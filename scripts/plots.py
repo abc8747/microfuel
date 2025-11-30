@@ -12,14 +12,14 @@ from matplotlib.ticker import ScalarFormatter
 from rich.logging import RichHandler
 from rich.progress import track
 
-import prc25.plot as p
-from prc25 import AIRCRAFT_TYPES, PATH_PLOTS_OUTPUT, Partition, Split
-from prc25.datasets import raw
+import microfuel.plot as p
+from microfuel import AIRCRAFT_TYPES, PATH_PLOTS_OUTPUT, Partition, Split
+from microfuel.datasets import raw
 
 if TYPE_CHECKING:
     from matplotlib.axes import Axes
 
-    from prc25.dataloader import VarlenBatch
+    from microfuel.dataloader import VarlenBatch
 
 logger = logging.getLogger(__name__)
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
@@ -302,8 +302,8 @@ def fuel_burn_segment_duration(partition: Partition = "phase1"):
     import numpy as np
     from rich.progress import track
 
-    from prc25 import AIRCRAFT_TYPES
-    from prc25.datasets import raw
+    from microfuel import AIRCRAFT_TYPES
+    from microfuel.datasets import raw
 
     fuel_df = raw.scan_fuel(partition).collect()
     flight_list_df = raw.scan_flight_list(partition).select("flight_id", "aircraft_type").collect()
@@ -369,7 +369,7 @@ def fuel_burn_segment_duration(partition: Partition = "phase1"):
 
 
 def _load_segment_info(partition: Partition) -> pl.LazyFrame:
-    from prc25 import PATH_PREPROCESSED
+    from microfuel import PATH_PREPROCESSED
 
     fname = f"segment_info_{partition}.parquet"
     path = PATH_PREPROCESSED / fname
@@ -573,8 +573,8 @@ def preprocessed_features_cdf(
     import polars as pl
     from rich.progress import track
 
-    from prc25.datasets import preprocessed
-    from prc25.datasets.preprocessed import TrajectoryIterator
+    from microfuel.datasets import preprocessed
+    from microfuel.datasets.preprocessed import TrajectoryIterator
 
     splits = preprocessed.load_splits(partition)
     segment_ids = splits[split]
@@ -644,7 +644,7 @@ def dataloader(
 ):
     from torch.utils.data import DataLoader
 
-    from prc25.dataloader import VarlenDataset, collate_fn
+    from microfuel.dataloader import VarlenDataset, collate_fn
 
     dataset = VarlenDataset(partition=partition, split=split)  # type: ignore
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
@@ -684,7 +684,7 @@ def _plot_varlen_batch(ax: Axes, data: VarlenBatch):
     import matplotlib.colors as colors
     import numpy as np
 
-    from prc25.datasets import preprocessed
+    from microfuel.datasets import preprocessed
 
     x = np.arange(data.x.size(0))
 
@@ -926,7 +926,7 @@ def predictions(predictions_path: Path, partition: Partition = "phase1"):
 
 
 def runs_multi_predictions():
-    from prc25 import PATH_PREDICTIONS
+    from microfuel import PATH_PREDICTIONS
 
     for f in PATH_PREDICTIONS.glob("*.parquet"):
         run_id = f.stem.removeprefix("gdn-all_ac-").removesuffix("_validation")

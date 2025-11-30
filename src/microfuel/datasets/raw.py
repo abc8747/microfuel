@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Annotated, Literal, TypedDict
 
 import polars as pl
 
-from .. import PATH_DATA, PATH_DATA_RAW, AircraftType, FlightId, Partition
+from .. import PATH_DATA, PATH_DATA_RAW, AircraftType, AirportIcao, FlightId, Partition
 
 if TYPE_CHECKING:
     import isqx
@@ -67,11 +67,24 @@ def download_from_s3(
 
 
 class FuelRecord(TypedDict):
-    idx: int
-    flight_id: FlightId
-    start: datetime
-    end: datetime
-    fuel_kg: Annotated[float, isqx.MASS(isqx.KG)]
+    """Fuel consumption data for a given flight interval. Path: `fuel_{partition}.parquet`."""
+
+    idx: Annotated[int, pl.Int64]
+    """Unique row identifier."""
+    flight_id: Annotated[FlightId, pl.Utf8]
+    """Links to the flight list and trajectory."""
+    start: Annotated[datetime, pl.Datetime(time_zone="UTC")]
+    """The start timestamp of the interval (usually an ACARS report)."""
+    end: Annotated[datetime, pl.Datetime(time_zone="UTC")]
+    """The end timestamp of the interval."""
+    fuel_kg: Annotated[float, pl.Float64, isqx.MASS(isqx.KG)]
+    """The target variable.
+
+    !!! warning
+        Note that this variable has quantisation artifacts: data is not a simple continuous
+        distribution but a composite from at least two distinct sources:
+        imperial (pounds) and metric (kilograms) units with a 2sf rounding step.
+    """
 
 
 def scan_fuel(
@@ -85,15 +98,21 @@ def scan_fuel(
 
 
 class FlightListRecord(TypedDict):
-    flight_id: FlightId
-    flight_date: datetime
-    takeoff: datetime
-    landed: datetime
-    origin_icao: str
-    origin_name: str
-    destination_icao: str
-    destination_name: str
-    aircraft_type: AircraftType
+    """Metadata for each flight in the dataset. Path: `flight_list_{partition}.parquet`."""
+
+    flight_id: Annotated[FlightId, pl.Utf8]
+    """A unique identifier for the flight."""
+    flight_date: Annotated[datetime, pl.Date]
+    """The date of the flight."""
+    takeoff: Annotated[datetime, pl.Datetime(time_zone="UTC")]
+    """The timestamp of takeoff."""
+    landed: Annotated[datetime, pl.Datetime(time_zone="UTC")]
+    """The timestamp of landing."""
+    origin_icao: Annotated[AirportIcao, pl.Utf8]
+    """ICAO code for the departure airport."""
+    destination_icao: Annotated[AirportIcao, pl.Utf8]
+    """ICAO code for the destination airport."""
+    aircraft_type: Annotated[AircraftType, pl.Utf8]
 
 
 def scan_flight_list(
@@ -107,10 +126,12 @@ def scan_flight_list(
 
 
 class AirportRecord(TypedDict):
-    icao: str
-    latitude: Annotated[float, isqx.LATITUDE(isqx.DEG)]
-    longitude: Annotated[float, isqx.LONGITUDE(isqx.DEG)]
-    elevation: Annotated[float, isqx.aerospace.GEOMETRIC_ALTITUDE(isqx.usc.FT)] | None
+    """Airport metadata. Path: `apt.parquet`."""
+
+    icao: Annotated[AirportIcao, pl.Utf8]
+    latitude: Annotated[float, pl.Float64, isqx.LATITUDE(isqx.DEG)]
+    longitude: Annotated[float, pl.Float64, isqx.LONGITUDE(isqx.DEG)]
+    elevation: Annotated[float, pl.Float64, isqx.aerospace.GEOMETRIC_ALTITUDE(isqx.usc.FT)] | None
 
 
 def scan_airports(*, path_base: Path = PATH_DATA_RAW) -> Annotated[pl.LazyFrame, AirportRecord]:
@@ -119,17 +140,19 @@ def scan_airports(*, path_base: Path = PATH_DATA_RAW) -> Annotated[pl.LazyFrame,
 
 
 class TrajectoryRecord(TypedDict):
-    timestamp: datetime
-    flight_id: FlightId
-    typecode: AircraftType
-    latitude: Annotated[float, isqx.LATITUDE(isqx.DEG)] | None
+    """Flight trajectory data points. Path: `flights_{partition}/{flight_id}.parquet`."""
+
+    timestamp: Annotated[datetime, pl.Datetime(time_unit="ns", time_zone="UTC")]
+    flight_id: Annotated[FlightId, pl.Utf8]
+    typecode: Annotated[AircraftType, pl.Utf8]
+    latitude: Annotated[float, pl.Float64, isqx.LATITUDE(isqx.DEG)] | None
     """Latitude, encoded via Compact Positional Reporting (CPR, tc=9-18, 20-22)
     We do not have access to uncertainty/quantisation, can be anywhere from:
 
     - navigational integrity category: nic=11 (rc < 7.5m)..nic=8 (rc < 185m)
     - navigational accuracy category: nacp=10 (epu < 10m)..nacp=8 (epu < 93m)"""
-    longitude: Annotated[float, isqx.LONGITUDE(isqx.DEG)] | None  # see above.
-    altitude: Annotated[float, isqx.aerospace.PRESSURE_ALTITUDE(isqx.usc.FT)] | None
+    longitude: Annotated[float, pl.Float64, isqx.LONGITUDE(isqx.DEG)] | None  # see above.
+    altitude: Annotated[float, pl.Float64, isqx.aerospace.PRESSURE_ALTITUDE(isqx.usc.FT)] | None
     """Barometric altitude (tc=9-18, 12-bit field). Not to be confused with GNSS altitude (tc=20-22)
 
     Quantisation: 'q' bit (bit 8 of the field):
@@ -137,7 +160,7 @@ class TrajectoryRecord(TypedDict):
     - q=0: 100-foot increments, using gray code for altitudes > 50,175 ft.
 
     Uncertainty: depends on barometric altitude quality (baq)."""
-    groundspeed: Annotated[float, isqx.aerospace.GS(isqx.usc.KNOT)] | None
+    groundspeed: Annotated[float, pl.Float64, isqx.aerospace.GS(isqx.usc.KNOT)] | None
     """Ground speed (GNSS or inertial reference system, tc=19, subtypes1-2).
 
     Not transmitted directly, encoded as two signed velocity components (east-west velocity,
@@ -148,28 +171,39 @@ class TrajectoryRecord(TypedDict):
 
     Quantisation: 1 kt (subsonic), 4 kt (supersonic).
     Uncertainty: nacv=4 (< 0.3m/s), nacv=3 (< 1.0m/s), nacv=2 (< 3.0m/s), nacv=1 (< 10.0m/s)"""
-    track: Annotated[float, isqx.DEG] | None  # see above.
-    vertical_rate: Annotated[float, isqx.aerospace.VS(isqx.usc.FT * isqx.MIN**-1)] | None
+    track: Annotated[float, pl.Float64, isqx.DEG] | None  # see above.
+    vertical_rate: (
+        Annotated[float, pl.Float64, isqx.aerospace.VS(isqx.usc.FT * isqx.MIN**-1)] | None
+    )
     """Vertical rate (`vrsrc` specifies origin: GNSS or barometric, tc=19).
 
     a sign bit indicates climb or descent. a 9-bit value (vr) encodes the magnitude.
     vertical speed (ft/min) = 64 * (vr - 1).
 
     Uncertainty: linked to vertical component of nacv."""
-    mach: Annotated[float, isqx.MACH_NUMBER] | None
+    mach: Annotated[float, pl.Float64, isqx.MACH_NUMBER] | None
     """Mach number (Mode S, BDS 6,0, 10 bits, mb 25-34).
 
     Quantisation: 0.004."""
-    TAS: Annotated[float, isqx.aerospace.TAS(isqx.usc.KNOT)] | None
+    TAS: Annotated[float, pl.Float64, isqx.aerospace.TAS(isqx.usc.KNOT)] | None
     """True airspeed.
 
     - ADS-B (tc=19, subtype 3/4) - Quantisation: 1 kt (subtype 3), 4 kt (subtype 4).
     - Mode S (BDS 5,0 track and turn report, 10 bits, mb 47-56) - Quantisation: 2 kt"""
-    CAS: Annotated[float, isqx.aerospace.CAS(isqx.usc.KNOT)] | None
+    CAS: Annotated[float, pl.Float64, isqx.aerospace.CAS(isqx.usc.KNOT)] | None
     """Calibrated airspeed. Not broadcast, but likely derived from indicated airspeed (BDS 6,0).
 
     Quantisation: 1 kt."""
-    source: Literal["adsb", "acars", "artificial"]
+    source: Annotated[Literal["adsb", "acars", "artificial"], pl.Utf8]
+    """Data source.
+
+    Data from `adsb` and `acars` have different characteristics.
+    `acars` data, for instance, may include `mach`, `TAS`, and `CAS`,
+    which are not present in standard ADS-B reports.
+
+    `artificial` data points are inserted from [microfuel.datasets.raw.FlightListRecord][] to aid
+    interpolation.
+    """
 
 
 def scan_all_trajectories(
@@ -188,3 +222,10 @@ def scan_trajectory(
     return pl.scan_parquet(fp).with_columns(
         pl.col("timestamp").dt.replace_time_zone("UTC"),
     )
+
+
+class SubmissionRecord(TypedDict):
+    idx: Annotated[FlightId, pl.Utf8]
+    """The row identifier."""
+    predicted_fuel_kg: Annotated[float, pl.Float64, isqx.MASS(isqx.KG)]
+    """Predicted fuel consumption (kilograms) for the given interval."""

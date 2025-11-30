@@ -49,7 +49,7 @@ Partition: TypeAlias = Literal["phase1", "phase1_rank", "phase2_rank"]
 Split: TypeAlias = Literal["train", "validation"]
 SPLITS: tuple[Split, ...] = get_args(Split)
 
-deg2rad = isqx.convert(isqx.RAD, isqx.DEG)
+deg2rad = isqx.convert(isqx.DEG, isqx.RAD)
 ft2m = isqx.convert(isqx.usc.FT, isqx.M)
 knot2mps = isqx.convert(isqx.usc.KNOT, isqx.M_PERS)
 fpm2mps = isqx.convert(isqx.usc.FT * isqx.MIN**-1, isqx.M_PERS)

@@ -1,66 +1,29 @@
-# PRC-DataChallenge
+# microfuel
 
-Open ML model to for learning the underlying continuous-time dynamics of an aircraft from a sparse, irregularly-sampled multivariate time series to accurately predict an integrated quantity (total fuel burn) over arbitrary future time intervals.
+`microfuel` is a high-performance, lightweight surrogate model for aircraft fuel consumption, trained using open ADS-B and ACARS data.
 
-[[Challenge Link](https://ansperformance.eu/study/data-challenge/)]
+It does not try to be the SOTA in prediction accuracy, but is developed with simplicity in mind:
+
+- no costly 4D weather grids evaluations required
+- no aircraft mass required
+- inputs: `aircraft_type`, smoothed time series of `altitude`, `groundspeed`, `vertical_rate` only.
+- output: cumulative fuel burn (kg) within the specified segment.
+
+Available model flavours:
+
+| Model                     | Number of Params | Test RMSE   | Description                                                                            |
+| :------------------------ | :--------------- | :---------- | :------------------------------------------------------------------------------------- |
+| `microfuel-v1.0-realtime` | 20,021           | 238.92 kg   | Sees only the specific flight segment being queried. Suitable for real-time inference. |
+| `microfuel-v1.0-offline`  | 66,689           | 222.54 kg ¹ | Processes the entire flight history. Suitable for high-fidelity post-flight analysis.  |
+
+¹ As of 2025-11-10 (end of phase 1), this model is ranked #4 out of 164 teams in the [PRC Data Challenge 2025](https://ansperformance.eu/study/data-challenge/dc2025/ranking.html).
 
 ## Installation
 
-Clone the repository, install and activate your virtual environment.
+The ultimate goal of this repository will be implement a numpy-only inference engine for maximum portability and minimal depedencies.
 
-With `pip`:
+However, the current repository is in a **pre-alpha state and not yet ready for production use**. The inference engine currently depends on heavy dependencies like `torch` and `triton`. Significant maintenance and breaking changes of this repo is planned. Model weights will be released once things have stabilised (hopefully by mid December 2025).
 
-```sh
-pip3 install virtualenv --break-system-packages
-virtualenv .venv
-. .venv/bin/activate
-pip3 install ".[dev]"
-```
+For an step-by-step explanation to reproduce the model, refer to the [quickstart in the documentation](https://abc8747.github.io/microfuel).
 
-Or `uv`:
-
-```sh
-pip3 install uv --break-system-packages
-uv venv
-uv sync --all-extras
-```
-
-Activate your virtual environment with `. .venv/bin/activate`, alternatively, use `uv run python3 scripts/{FILENAME}.py` to run a particular script.
-
-For `causal-conv1d` support, make sure you have [`nvcc`](https://developer.nvidia.com/cuda-downloads) installed.
-
-This repo does not come with raw data.
-You may want to install the MinIO client (`mc`), necessary for pulling and pushing to OpenSky's S3 bucket.
-
-## Quickstart
-
-Code is structured as follows:
-
-- `src/prc25`: core library code
-- `scripts`: CLI-based tools
-
-## Documentation
-
-In the root directory, run
-
-```sh
-mkdocs build
-```
-
-and navigate to <https://localhost:8080/prc25/>.
-
-## Python Code style
-
-1. Prefer pure functions over OOP.
-2. Prefer scripts over notebooks. If you want interactive cells, use [`#%%` in `scripts`](https://code.visualstudio.com/docs/python/jupyter-support-py).
-
-We use the following tools to check the style on each push:
-
-- [Ruff](https://github.com/astral-sh/ruff) for linting,
-- [MyPy](https://github.com/python/mypy) for type checking
-
-Locally, run the following before committing:
-
-```sh
-just fmt
-```
+A [`tangram` plugin](https://github.com/open-aviation/tangram) will also be created to demonstrate real-time fuel inference from [`jet1090` data](https://github.com/xoolive/rs1090).

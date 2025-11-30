@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Annotated, Literal, NamedTuple, assert_never, 
 import typer
 from rich.logging import RichHandler
 
-from prc25 import PATH_CHECKPOINTS, PATH_DATA_RAW, PATH_PREDICTIONS, Partition, Split
+from microfuel import PATH_CHECKPOINTS, PATH_DATA_RAW, PATH_PREDICTIONS, Partition, Split
 
 if TYPE_CHECKING:
     from typing import Any
@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     import torch
     from rich.progress import Progress
 
-    from prc25.model import FuelBurnPredictor, FuelBurnPredictorConfig
+    from microfuel.model import FuelBurnPredictor, FuelBurnPredictorConfig
 
 
 logger = logging.getLogger(__name__)
@@ -37,7 +37,7 @@ class PredResult(NamedTuple):
 
 @app.command()
 def download_raw():
-    from prc25.datasets.raw import download_from_s3, load_config
+    from microfuel.datasets.raw import download_from_s3, load_config
 
     config = load_config()
     download_from_s3(config["bucket_access_key"], config["bucket_access_secret"])
@@ -45,8 +45,8 @@ def download_raw():
 
 @app.command()
 def create_actype_enum(partition: Partition = "phase1"):
-    from prc25 import AIRCRAFT_TYPES
-    from prc25.datasets import raw
+    from microfuel import AIRCRAFT_TYPES
+    from microfuel.datasets import raw
 
     df = raw.scan_flight_list(partition).collect()
     top_ac_types = (
@@ -70,7 +70,7 @@ def create_splits(
     train_split: float = 0.8,
     seed: int = 25,
 ):
-    from prc25.datasets.preprocessed import make_splits
+    from microfuel.datasets.preprocessed import make_splits
 
     make_splits(partition=partition, train_split=train_split, seed=seed)
 
@@ -79,16 +79,25 @@ def create_splits(
 def create_dataset(
     partition: Partition,
 ):
-    from prc25.datasets.preprocessed import make_trajectories
+    from microfuel.datasets.preprocessed import make_trajectories
 
     make_trajectories(partition=partition)
+
+
+@app.command()
+def create_derived_features(
+    partition: Partition,
+):
+    from microfuel.datasets.preprocessed import make_derived_features
+
+    make_derived_features(partition=partition)
 
 
 @app.command()
 def create_stats(
     partition: Partition,
 ):
-    from prc25.datasets.preprocessed import make_standardisation_stats
+    from microfuel.datasets.preprocessed import make_standardisation_stats
 
     make_standardisation_stats(partition=partition)
 
@@ -99,17 +108,12 @@ def create_segment_info(partition: Partition):
     import polars as pl
     from rich.progress import track
 
-    from prc25 import PATH_PREPROCESSED
-    from prc25.datasets import preprocessed, raw
+    from microfuel import PATH_PREPROCESSED
+    from microfuel.datasets import preprocessed
 
-    flight_ids = (
-        raw.scan_fuel(partition).select("flight_id").unique().collect()["flight_id"].to_list()
-    )
     description = f"extracting segment info {partition}/all"
 
-    iterator = preprocessed.TrajectoryIterator(
-        partition, flight_ids=flight_ids, start_to_end_only=True
-    )
+    iterator = preprocessed.TrajectoryIterator(partition, start_to_end_only=True)
 
     segment_stats_data = []
     for trajectory in track(iterator, description=description, total=len(iterator)):
@@ -197,7 +201,7 @@ def download_era5(
 def create_era5(
     partition: Partition,
 ):
-    from prc25.datasets.preprocessed import make_era5
+    from microfuel.datasets.preprocessed import make_era5
 
     make_era5(partition=partition)
 
@@ -229,7 +233,7 @@ class Checkpoint:
 def train(
     partition: Partition = "phase1",
     batch_size: int = 64,
-    epochs: int = 20,
+    epochs: int = 50,
     lr: float = 4e-4,
     hidden_size: int = 32,
     num_heads: int = 2,
@@ -253,6 +257,7 @@ def train(
     weight_decay: float = 0.1,
     warmup_steps: int = 250,
     seed: int = 13,
+    evaluate_every: Annotated[int, typer.Option(help="Evaluate the model every n steps.")] = 500,
 ):
     import math
 
@@ -268,15 +273,15 @@ def train(
     from torch.optim.lr_scheduler import LambdaLR
     from torch.utils.data import DataLoader
 
-    from prc25.hacks import install_optimized_kernels_
+    from microfuel.hacks import install_optimized_kernels_
 
     install_optimized_kernels_()
     torch.manual_seed(seed)
     import polars as pl
 
     import wandb
-    from prc25.dataloader import VarlenDataset, collate_fn
-    from prc25.model import FuelBurnPredictor, FuelBurnPredictorConfig
+    from microfuel.dataloader import VarlenDataset, collate_fn
+    from microfuel.model import FuelBurnPredictor, FuelBurnPredictorConfig
 
     # NOTE: loading this takes 16GB of RAM on start, but drops to ~4GB
     train_dataset = VarlenDataset(partition=partition, split="train")
@@ -444,7 +449,7 @@ def train(
                 scheduler.step()
                 scaler.update()
 
-                if global_step > 0 and global_step % 25 == 0:
+                if global_step > 0 and global_step % evaluate_every == 0:
                     eval_result = _run_inference(
                         model, val_dataloader, device, progress, "validating", is_eval=True
                     )
@@ -674,12 +679,12 @@ def evaluate(
     from rich.progress import Progress
     from torch.utils.data import DataLoader
 
-    from prc25.datasets import raw
-    from prc25.hacks import install_optimized_kernels_
+    from microfuel.datasets import raw
+    from microfuel.hacks import install_optimized_kernels_
 
     install_optimized_kernels_()
-    from prc25.dataloader import VarlenDataset, collate_fn
-    from prc25.model import FuelBurnPredictor, FuelBurnPredictorConfig
+    from microfuel.dataloader import VarlenDataset, collate_fn
+    from microfuel.model import FuelBurnPredictor, FuelBurnPredictorConfig
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"using device: {device}")
@@ -739,18 +744,26 @@ def submit(
     predictions_path: Annotated[
         Path, typer.Argument(help="Path to the prediction parquet file generated by `evaluate`.")
     ],
-    version: Annotated[int, typer.Option("--version", "-v", help="Submission version number.")],
+    version: Annotated[
+        int | None, typer.Option("--version", "-v", help="Submission version number.")
+    ] = None,
+    final: bool = False,
 ):
     import os
 
     import polars as pl
 
-    from prc25.datasets.raw import load_config, setup_mc_alias
+    from microfuel.datasets.raw import load_config, setup_mc_alias
 
     df = pl.read_parquet(predictions_path)
     config = load_config()
     team_name = config.get("team_name")
-    final_filename = f"{team_name}_v{version}.parquet"
+    if version and final:
+        raise typer.BadParameter("cannot specify both --version and --final")
+    if not version and not final:
+        raise typer.BadParameter("must specify either --version or --final")
+    suffix = "_final" if final else f"_v{version}"
+    final_filename = f"{team_name}{suffix}.parquet"
 
     alias_name = "prc25"
     bucket_name = f"prc-2025-{team_name}"

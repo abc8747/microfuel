@@ -100,20 +100,23 @@ class FuelBurnPredictorConfig:
     num_aircraft_types: int
     aircraft_embedding_dim: int
     num_layers: int
-    pooler_mode: Literal["mean", "last"]
+    pooler_mode: Literal["mean", "last"]  # TODO: get rid of this, only support last
 
 
 class FuelBurnPredictor(nn.Module):
-    """Terminology:
+    r"""Gated Delta Network for fuel burn estimation.
 
-    We have three *segments* of the trajectory, which range from 2 to thousands of tokens:
-        - [takeoff, start]
-        - [start, end]: the segment for which we predict fuel burn
-        - [end, arrival]
+    It processes data at two resolutions to solve the mass identifiability problem:
 
-    This model processes the [start, end] segment and the full [takeoff, arrival] flight.
+    1. Processes the high-fidelity kinematics $x_{t:t+\Delta}$ for the specific query interval.
+    2. Processes the entire trajectory $x_{0:T}$ (takeoff to landing).
 
-    Instead of padding, sequences are tightly packed together in a long tensor, and
+    Hypothesis:
+        The `pooled_flight` vector acts as a compressed context containing
+        implicit estimates of the aircraft's takeoff mass and degradation factors,
+        which are globally observable over the full flight but locally unobservable.
+
+    NOTE: Instead of padding, sequences are tightly packed together in a long tensor, and
     FLA is informed of boundaries via the `cu_seqlens` tensor.
     """
 
