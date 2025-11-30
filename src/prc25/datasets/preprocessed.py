@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import multiprocessing
+import traceback
 from collections import namedtuple
+from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, TypedDict, get_args
 
@@ -12,7 +15,16 @@ import numpy as np
 import polars as pl
 from rich.progress import track
 
-from .. import PATH_PREPROCESSED, Coordinate2D, Partition, Split, fpm2mps, ft2m, knot2mps
+from .. import (
+    PATH_DATA_RAW,
+    PATH_PREPROCESSED,
+    Coordinate2D,
+    Partition,
+    Split,
+    fpm2mps,
+    ft2m,
+    knot2mps,
+)
 from . import raw
 
 if TYPE_CHECKING:
@@ -484,6 +496,8 @@ def make_trajectories(
         alt_raw = ft2m(full_traj_df["altitude"].to_numpy())
         gs_raw = knot2mps(full_traj_df["groundspeed"].to_numpy())
         track_raw_rad = np.deg2rad(full_traj_df["track"].to_numpy())
+        lat_raw = full_traj_df["latitude"].to_numpy()
+        lng_raw = full_traj_df["longitude"].to_numpy()
 
         vs_outlier_mask = (np.abs(vs_raw) > vertical_speed_max) | np.isnan(vs_raw)
         alt_outlier_mask = (alt_raw > altitude_max) | np.isnan(alt_raw)
@@ -666,6 +680,8 @@ def make_trajectories(
                 "time_till_arrival": (
                     timestamp_landed - full_traj_df["timestamp"]
                 ).dt.total_seconds(fractional=True),
+                "latitude": _np_interpolate(lat_raw, timestamp_s),
+                "longitude": _np_interpolate(lng_raw, timestamp_s),
                 "vertical_rate": _np_interpolate(vs_res.val, timestamp_s),
                 "vertical_rate_is_outlier": (vs_outlier_mask | np.isnan(vs_res.val)),
                 "altitude": _np_interpolate(alt_res.val, timestamp_s),
@@ -712,6 +728,171 @@ def _monitor_file_size(path: Path, stop_event: Event, *, dt: float = 0.2, name: 
                 size = path.stat().st_size
                 progress.update(task, completed=size)
             time.sleep(dt)
+
+
+def altitude_to_pressure_std(altitude_m):
+    # P ~ P0 * (1 - L*h/T0)^(gM/RL)
+    return 1013.25 * (1 - 2.25577e-5 * altitude_m).pow(5.25588)
+
+
+def make_era5(
+    partition: Partition,
+    *,
+    path_base: Path = PATH_PREPROCESSED,
+    path_raw_weather: Path = PATH_DATA_RAW / "era5",
+):
+    import xarray as xr
+
+    path_base.mkdir(exist_ok=True, parents=True)
+    path_out_dir = path_base / f"weather_{partition}"
+    path_out_dir.mkdir(exist_ok=True, parents=True)
+
+    traj_lf = pl.scan_parquet(path_base / f"trajectories_{partition}.parquet")
+
+    df_coords = (
+        traj_lf.select(
+            "flight_id",
+            "timestamp",
+            "latitude",
+            "longitude",
+            "altitude",
+        )
+        .with_columns(
+            date_key=pl.col("timestamp").dt.date(),
+            pressure_level=altitude_to_pressure_std(pl.col("altitude")),
+            longitude_era5=(pl.col("longitude") + 360) % 360,
+        )
+        .sort("timestamp")
+        .collect()
+    )
+
+    unique_dates = df_coords["date_key"].unique().sort()
+    logger.info(f"extracting weather for {len(unique_dates)} unique days")
+
+    def _process_variable(
+        variable_dir: Path,
+        variable_names: list[str],
+        batch_times: tuple,
+        targets: dict,
+    ) -> np.ndarray | None:
+        files = sorted(variable_dir.glob("*.nc"), key=lambda p: int(p.stem))
+        if not files:
+            return None
+
+        levels = [int(p.stem) for p in files]
+
+        try:
+            ds = xr.open_mfdataset(
+                files,
+                combine="nested",
+                concat_dim="level",
+                parallel=False,
+                chunks={"time": 1},
+            )
+            ds.coords["level"] = levels
+
+            var_name = next((v for v in variable_names if v in ds), None)
+            if not var_name:
+                raise ValueError(f"vars {variable_names} not found in {variable_dir}")
+
+            ds = ds.sortby(["time", "latitude", "level"])
+
+            min_t, max_t = batch_times
+            da_sliced = ds[var_name].sel(time=slice(min_t, max_t))
+
+            da_loaded = da_sliced.load()
+            ds.close()
+
+            # "fill_value": None enables extrapolation in scipy's RegularGridInterpolator
+            interp_res = da_loaded.interp(
+                time=targets["time"],
+                latitude=targets["latitude"],
+                longitude=targets["longitude"],
+                level=targets["level"],
+                method="linear",
+                kwargs={"bounds_error": False, "fill_value": None},
+            )
+
+            result = interp_res.values
+
+            del da_loaded
+            del ds
+            gc.collect()
+
+            return result
+
+        except Exception:
+            logger.error(f"failed to process {variable_dir}:\n{traceback.format_exc()}")
+            return None
+
+    for date_key in track(unique_dates, description="processing daily weather"):
+        output_path = path_out_dir / f"{date_key}.parquet"
+        if output_path.exists():
+            continue
+
+        batch = df_coords.filter(pl.col("date_key") == date_key)
+        if batch.height == 0:
+            continue
+
+        logger.info(f"processing {date_key}: {batch.height} points")
+
+        year = f"{date_key.year}"
+        month = f"{date_key.month:02d}"
+        day = f"{date_key.day:02d}"
+        day_path = path_raw_weather / year / month / day
+
+        if not day_path.exists():
+            continue
+
+        target_time = xr.DataArray(batch["timestamp"].to_numpy(), dims="points")
+        target_lats = xr.DataArray(batch["latitude"].to_numpy(), dims="points")
+        target_lons = xr.DataArray(batch["longitude_era5"].to_numpy(), dims="points")
+        target_level = xr.DataArray(batch["pressure_level"].to_numpy(), dims="points")
+
+        targets = {
+            "time": target_time,
+            "latitude": target_lats,
+            "longitude": target_lons,
+            "level": target_level,
+        }
+
+        min_time = batch["timestamp"].min().replace(tzinfo=None) - timedelta(hours=2)  # type: ignore
+        max_time = batch["timestamp"].max().replace(tzinfo=None) + timedelta(hours=2)  # type: ignore
+
+        u_values = _process_variable(
+            day_path / "u_component_of_wind",
+            ["u", "u_component_of_wind", "var131"],
+            (min_time, max_time),
+            targets,
+        )
+        if u_values is None:
+            continue
+
+        v_values = _process_variable(
+            day_path / "v_component_of_wind",
+            ["v", "v_component_of_wind", "var132"],
+            (min_time, max_time),
+            targets,
+        )
+        if v_values is None:
+            continue
+
+        chunk_res = pl.DataFrame(
+            {
+                "flight_id": batch["flight_id"],
+                "timestamp": batch["timestamp"],
+                "u_wind": u_values,
+                "v_wind": v_values,
+            }
+        )
+        chunk_res.write_parquet(output_path)
+
+        del chunk_res
+        del u_values
+        del v_values
+        gc.collect()
+
+    logger.info(f"wrote daily weather chunks to {path_out_dir}")
 
 
 #

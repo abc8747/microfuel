@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Annotated, Literal, NamedTuple, assert_never, 
 import typer
 from rich.logging import RichHandler
 
-from prc25 import PATH_CHECKPOINTS, PATH_PREDICTIONS, Partition, Split
+from prc25 import PATH_CHECKPOINTS, PATH_DATA_RAW, PATH_PREDICTIONS, Partition, Split
 
 if TYPE_CHECKING:
     from typing import Any
@@ -128,6 +128,78 @@ def create_segment_info(partition: Partition):
     output_path = PATH_PREPROCESSED / f"segment_info_{partition}.parquet"
     df.write_parquet(output_path)
     logger.info(f"wrote segment stats to {output_path}")
+
+
+#
+# weather
+#
+
+# fmt: off
+DEFAULT_LEVELS_BELOW_60K_FT = [
+    "70", "100", "125", "150", "175", "200", "225", "250", "300",
+    "350", "400", "450", "500", "550", "600", "650", "700", "750",
+    "775", "800", "825", "850", "875", "900", "925", "950", "975", "1000"
+]
+# fmt: on
+
+
+@app.command()
+def download_era5(
+    year: str = "2025",
+    months: list[str] = ["04", "05", "06", "07", "08", "09", "10"],
+    variables: list[str] = ["u_component_of_wind", "v_component_of_wind"],
+    levels: list[str] = DEFAULT_LEVELS_BELOW_60K_FT,
+    base_url: str = "gs://gcp-public-data-arco-era5/raw/date-variable-pressure_level",
+    path_base: Path = PATH_DATA_RAW / "era5",
+):
+    import calendar
+    import subprocess
+
+    logger.info(f"starting download for {year} months: {months}")
+    logger.info(f"variables: {variables}")
+    logger.info(f"levels: {len(levels)} levels")
+
+    for month in months:
+        _, days_in_month = calendar.monthrange(int(year), int(month))
+
+        for day_int in range(1, days_in_month + 1):
+            day = f"{day_int:02d}"
+            logger.info(f"processing {year}-{month}-{day}...")
+
+            for var in variables:
+                dest_dir = path_base / year / month / day / var
+                dest_dir.mkdir(parents=True, exist_ok=True)
+
+                existing = list(dest_dir.glob("*.nc"))
+                if len(existing) == len(levels):
+                    logger.info(f"skipping {dest_dir}, already populated")
+                    continue
+
+                url_list = []
+                for lvl in levels:
+                    url = f"{base_url}/{year}/{month}/{day}/{var}/{lvl}.nc"
+                    url_list.append(url)
+
+                process = subprocess.Popen(
+                    ["gcloud", "storage", "cp", "-I", str(dest_dir)],
+                    stdin=subprocess.PIPE,
+                    text=True,
+                )
+                process.communicate(input="\n".join(url_list))
+
+                if process.returncode != 0:
+                    logger.error(f"failed to download batch for {year}-{month}-{day} {var}")
+
+    logger.info("download complete")
+
+
+@app.command()
+def create_era5(
+    partition: Partition,
+):
+    from prc25.datasets.preprocessed import make_era5
+
+    make_era5(partition=partition)
 
 
 @dataclass

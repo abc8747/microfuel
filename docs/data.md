@@ -2,13 +2,29 @@
 
 ## First party data
 
-Directly from the S3 bucket.
-<!-- NOTE: `flightlist_train.parquet` renamed to `flight_list_train.parquet` for consistency -->
+Directly from the S3 bucket. For consistency:
+
+```sh
+mv flightlist_train.parquet flight_list_phase1.parquet
+mv fuel_train.parquet fuel_phase1.parquet
+mv flights_train flights_phase1 
+
+mv flightlist_rank.parquet flight_list_phase1_rank.parquet
+mv fuel_rank_submission.parquet fuel_phase1_rank.parquet
+mv flights_rank flights_phase1_rank
+
+mv flightlist_final.parquet flight_list_phase2_rank.parquet
+mv fuel_train.parquet fuel_phase2_rank.parquet
+mv flights_final flights_phase2_rank
+```
+
 ### 1. Fuel Data (`fuel_*.parquet`)
 
-133,984 rows (train)
+133,984 rows (phase 1 train)
 
-24,972 rows (rank)
+24,972 rows (phase 1 rank)
+
+61,745 rows (phase 2 rank)
 
 | Column      | Units | Type                    | Description                                                    |
 | ----------- | ----- | ----------------------- | -------------------------------------------------------------- |
@@ -26,9 +42,11 @@ Directly from the S3 bucket.
 
 ### 2. Flight List (`flight_list_*.parquet`)
 
-124,094,050 total rows (train, 11088 files, 3.2G)
+124,094,050 total rows (phase 1 train, 11088 files, 3.2G)
 
-24,499,924 total rows (rank, 1929 files, 616M)
+24,499,924 total rows (phase 1 rank, 1929 files, 616M)
+
+37,877,494 total rows (phase 2 rank, 2839 files, 943M)
 
 | Column             | Units | Type      | Description                           |
 | ------------------ | ----- | --------- | ------------------------------------- |
@@ -75,6 +93,37 @@ Time-series state vectors for each flight: trajectories may be incomplete and co
 | `latitude`  | degrees | DOUBLE  | Airport latitude coordinate            |
 | `longitude` | degrees | DOUBLE  | Airport longitude coordinate           |
 | `elevation` | ft      | DOUBLE  | Airport elevation (may be NULL)        |
+
+### 5. Weather Data (ERA5)
+
+We augment the trajectory data with U and V wind components extracted from the [ARCO ERA5](https://github.com/google-research/arco-era5) dataset.
+
+Please install the package with the `era5` optional dependency.
+
+1. The raw weather data is massive, we recommend a using an extenral HDD and symlink to `data/raw/weather`:
+
+    ```sh
+    mkdir -p /mnt/hdd/prc25_era5
+    ln -s /mnt/hdd/prc25_era5 data/raw/era5
+    ```
+
+2. We use `gcloud` to pull specific pressure level slices (NetCDF).
+
+    ```sh
+    # Requires google-cloud-sdk installed
+    uv run scripts/main.py download-era5
+    ```
+
+    Months: April - October 2025.
+    Variables: `u_component_of_wind`, `v_component_of_wind`
+    Levels: 28 levels from 1000 hPa to 70 hPa
+    Size: 565G
+
+3. We interpolate the 4D weather grid (time, level, lat, lon) onto the 4D flight trajectory coordinates.
+
+    ```sh
+    uv run scripts/main.py create-era5 --partition phase1
+    ```
 
 ## Submission Format
 

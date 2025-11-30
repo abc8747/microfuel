@@ -45,7 +45,7 @@ AircraftType: TypeAlias = Literal[
 ]
 AIRCRAFT_TYPES: tuple[AircraftType, ...] = get_args(AircraftType)
 AirportIcao: TypeAlias = str
-Partition: TypeAlias = Literal["phase1", "phase1_rank"]
+Partition: TypeAlias = Literal["phase1", "phase1_rank", "phase2_rank"]
 Split: TypeAlias = Literal["train", "validation"]
 SPLITS: tuple[Split, ...] = get_args(Split)
 

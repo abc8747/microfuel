@@ -22,6 +22,10 @@ dependencies = [
 cli = ["typer>=0.19"]
 plots = ["matplotlib>=3.10"]
 pyqt6 = ["pyqt6>=6.10.0"]
+era5 = [
+    "dask>=2025.11.0",
+    "xarray>=2025.6.1",
+]
 
 [dependency-groups]
 docs = ["mkdocs-material[imaging]>=9.6.14", "mkdocstrings-python>=1.16.11"]

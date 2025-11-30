@@ -90,6 +90,9 @@ def _compute_and_standardise_features(
     )
 
 
+AC_TYPE_ALIASES = {"B734": "B737"}  # quick hack to avoid issues with phase2 missing aircraft types
+
+
 def _prepare_tensors(
     partition: Partition,
     flight_ids: list[str],
@@ -152,7 +155,11 @@ def _prepare_tensors(
 
         duration_s = (row["end"] - row["start"]).total_seconds()
         target = np.log1p((row["fuel_kg"] or np.nan) / duration_s)
-        ac_type_idx = ac_type_vocab[row["aircraft_type"]]
+        ac_type = row["aircraft_type"]
+        if ac_type not in ac_type_vocab:
+            logger.warning(f"aircraft type '{ac_type}' not in vocab, applying fallback.")
+            ac_type = AC_TYPE_ALIASES[ac_type]
+        ac_type_idx = ac_type_vocab[ac_type]
 
         sequences.append(
             SequenceInfo(
@@ -192,8 +199,7 @@ class VarlenDataset(Dataset):
             )
 
         # always get train stats for submission
-        stats_partition: Partition = partition.removesuffix("_rank")  # type: ignore
-        self.stats = preprocessed.load_standardisation_stats(stats_partition)
+        self.stats = preprocessed.load_standardisation_stats("phase1")
         self.ac_type_vocab = {ac_type: i for i, ac_type in enumerate(AIRCRAFT_TYPES)}
 
         self.all_features, self.sequences = _prepare_tensors(
