@@ -552,6 +552,14 @@ def make_trajectories(
         gs_smooth[gs_track_outlier_mask] = np.nan
         track_rate_smooth[gs_track_outlier_mask] = np.nan
 
+        v_east_interp = _np_interpolate(v_east_smooth, timestamp_s)
+        v_north_interp = _np_interpolate(v_north_smooth, timestamp_s)
+
+        # 0=N, 90=E
+        track_interp_rad = np.arctan2(v_east_interp, v_north_interp)
+        track_interp_deg = np.rad2deg(track_interp_rad)
+        track_interp_deg = np.where(track_interp_deg < 0, track_interp_deg + 360, track_interp_deg)
+
         if i < 100 or (plot_every_n_flights is not None and i % plot_every_n_flights == 0):
             # import matplotlib
             import matplotlib.pyplot as plt
@@ -637,11 +645,8 @@ def make_trajectories(
             ax_gs.set_ylim(0, speed_max)
             ax_gs.legend()
 
-            track_smooth_rad = np.arctan2(v_east_smooth, v_north_smooth)
-            track_smooth_deg = np.rad2deg(track_smooth_rad)
-            track_smooth_deg[track_smooth_deg < 0] += 360
             ax_track.plot(
-                timestamp_s, track_smooth_deg, "r.", markersize=0.5, label="smoothed track"
+                timestamp_s, track_interp_deg, "r.", markersize=0.5, label="smoothed track"
             )
             ax_track.set_ylabel("track (deg)")
             ax_track.set_ylim(0, 360)
@@ -690,6 +695,7 @@ def make_trajectories(
                 "groundspeed_is_outlier": (
                     gs_outlier_mask | gs_smooth_outlier_mask | np.isnan(gs_smooth)
                 ),
+                "track": track_interp_deg,
                 "track_rate": _np_interpolate(track_rate_smooth, timestamp_s),
                 "track_rate_is_outlier": (track_rate_outlier_mask | np.isnan(track_rate_smooth)),
             }

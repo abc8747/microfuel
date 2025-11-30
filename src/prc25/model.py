@@ -119,10 +119,6 @@ class FuelBurnPredictor(nn.Module):
 
     def __init__(self, cfg: FuelBurnPredictorConfig):
         super().__init__()
-        from .hacks import fla_autotuner_check_removed_nb
-
-        fla_autotuner_check_removed_nb()
-
         self.config = cfg
         key_dim = int(cfg.hidden_size * 0.75)  # as per docstring
         assert key_dim % cfg.num_heads == 0, (

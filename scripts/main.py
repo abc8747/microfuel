@@ -229,11 +229,11 @@ class Checkpoint:
 def train(
     partition: Partition = "phase1",
     batch_size: int = 64,
-    epochs: int = 10,
-    lr: float = 3e-4,
+    epochs: int = 20,
+    lr: float = 4e-4,
     hidden_size: int = 32,
     num_heads: int = 2,
-    num_layers: int = 1,
+    num_layers: int = 3,
     aircraft_embedding_dim: int = 8,
     pooler_mode: Literal["mean", "last"] = "last",
     beta: Annotated[
@@ -268,9 +268,9 @@ def train(
     from torch.optim.lr_scheduler import LambdaLR
     from torch.utils.data import DataLoader
 
-    from prc25.hacks import fla_autotuner_remove_nb
+    from prc25.hacks import install_optimized_kernels_
 
-    fla_autotuner_remove_nb()
+    install_optimized_kernels_()
     torch.manual_seed(seed)
     import polars as pl
 
@@ -675,9 +675,9 @@ def evaluate(
     from torch.utils.data import DataLoader
 
     from prc25.datasets import raw
-    from prc25.hacks import fla_autotuner_remove_nb
+    from prc25.hacks import install_optimized_kernels_
 
-    fla_autotuner_remove_nb()
+    install_optimized_kernels_()
     from prc25.dataloader import VarlenDataset, collate_fn
     from prc25.model import FuelBurnPredictor, FuelBurnPredictorConfig
 
