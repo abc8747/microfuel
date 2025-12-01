@@ -1,6 +1,6 @@
 # microfuel
 
-`microfuel` is a high-performance, lightweight surrogate model for aircraft fuel consumption, trained using open ADS-B and ACARS data.
+`microfuel` is a high-performance, lightweight model for aircraft fuel consumption prediction, trained using open ADS-B and ACARS data.
 
 It does not try to be the SOTA in prediction accuracy, but is developed with simplicity in mind:
 

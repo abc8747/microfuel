@@ -395,6 +395,7 @@ def make_trajectories(
     """Creates train/validation split of preprocessed trajectories.
 
     Handles the alignment of asynchronous data sources:
+
     1. Flight List: [takeoff, landing] constraints.
     2. Fuel Data: segment boundaries.
     3. ADS-B + ACARS: raw state observations.

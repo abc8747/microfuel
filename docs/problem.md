@@ -54,7 +54,7 @@ $$
 2. It calculates the innovation, or the difference between the actual information $v_t$ and the retrieved information.
 3. It updates the memory matrix $S$ by moving it in the direction of the error, weighted by the step size $\beta_t$.
 
-This effectively makes the GDN a "Fast Weight Programmer". The memory $S_t$ is a dynamic linear model that is continuously re-optimised (trained) at every time step to minimise the reconstruction error of the incoming flight data stream.
+This effectively makes the GDN a "Fast Weight Programmer" ([Schlag et al. (2021)](https://arxiv.org/abs/2102.11174)). The memory $S_t$ is a dynamic linear model that is continuously re-optimised (trained) at every time step to minimise the reconstruction error of the incoming flight data stream.
 
 ### Inference Modes: Realtime vs. Offline
 
