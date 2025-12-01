@@ -464,6 +464,8 @@ def make_trajectories(
             .sort()
         )
 
+        # NOTE: discarding duplicate timestamps is a bad idea! sometimes the time gets "stuck"
+        # and we lose a lot of useful information.
         traj_df = traj_lf.unique(subset=["timestamp"], keep="first").sort("timestamp").collect()
         timestamps_existing = traj_df.select("timestamp").to_series()
         # takeoff time in flight list usually precedes the first timestamp in trajectory data

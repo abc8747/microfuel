@@ -8,6 +8,7 @@ nav:
   - Quickstart: "quickstart.md"
   - Data: "data.md"
   - Problem: "problem.md"
+  - Comparison: "comparison.md"
   - API Reference: "api.md"
 
 theme:

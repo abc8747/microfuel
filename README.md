@@ -1,29 +1,35 @@
 # microfuel
 
-`microfuel` is a high-performance, lightweight model for aircraft fuel consumption prediction, trained using open ADS-B and ACARS data.
+[Documentation](https://abc8747.github.io/microfuel)
 
-It does not try to be the SOTA in prediction accuracy, but is developed with simplicity in mind:
+`microfuel` is a lightweight, end-to-end differentiable surrogate model for aircraft fuel consumption.
 
-- no costly 4D weather grids evaluations required
-- no aircraft mass required
-- inputs: `aircraft_type`, smoothed time series of `altitude`, `groundspeed`, `vertical_rate` only.
-- output: cumulative fuel burn (kg) within the specified segment.
+While the prevalent approach involves using Gradient Boosted Decision Trees (LightGBM/XGBoost) fed by extensive manual feature engineering and external data, they are non-differentiable.
 
-Available model flavours:
+We ask the question: How accurate can we be at fuel flow prediction using raw kinematics alone, while maintaining the smoothness required for gradient-based trajectory optimisation?
 
-| Model                     | Number of Params | Test RMSE   | Description                                                                            |
-| :------------------------ | :--------------- | :---------- | :------------------------------------------------------------------------------------- |
-| `microfuel-v1.0-realtime` | 20,021           | 238.92 kg   | Sees only the specific flight segment being queried. Suitable for real-time inference. |
-| `microfuel-v1.0-offline`  | 66,689           | 222.54 kg ¹ | Processes the entire flight history. Suitable for high-fidelity post-flight analysis.  |
+## Performance
 
-¹ As of 2025-11-10 (end of phase 1), this model is ranked #4 out of 164 teams in the [PRC Data Challenge 2025](https://ansperformance.eu/study/data-challenge/dc2025/ranking.html).
+We strongly prioritise simplicity over marginal gains in predictive accuracy derived from exogenous data dependencies.
+
+- Inputs: `aircraft_type`, `flight_duration` and smoothed time series of {`altitude`, `groundspeed`, `vertical_rate`}.
+- Output: Average fuel burn rate $\dot{m}_f$ (kg/s) in a specified segment.
+
+| Model                     | Parameters | Test RMSE   | Capability                                                                            |
+| :------------------------ | :--------- | :---------- | :------------------------------------------------------------------------------------ |
+| `microfuel-v1.0-realtime` | 20,021     | 238.92 kg   | Only relies on information within the segment. Suitable for real-time inference.      |
+| `microfuel-v1.0-offline`  | 66,689     | 222.54 kg ¹ | Processes the entire flight history. Suitable for high-fidelity post-flight analysis. |
+
+¹ As of 2025-11-10, this model is ranked #4 out of 164 teams in [Phase 1 of the PRC Data Challenge 2025](https://ansperformance.eu/study/data-challenge/dc2025/ranking.html). No changes to the model were made in Phase 2.
+
+For a detailed comparison of the architecture and methodology against SOTA models, see the [comparison section of our documentation](https://abc8747.github.io/microfuel/comparison).
 
 ## Installation
 
-The ultimate goal of this repository will be implement a numpy-only inference engine for maximum portability and minimal depedencies.
+The repository is currently in a **pre-alpha state and not ready for production use**. While the ultimate goal is a NumPy-only inference engine for maximum portability, the current training code relies on `torch` and `triton`.
 
-However, the current repository is in a **pre-alpha state and not yet ready for production use**. The inference engine currently depends on heavy dependencies like `torch` and `triton`. Significant maintenance and breaking changes of this repo is planned. Model weights will be released once things have stabilised (hopefully by mid December 2025).
+By the end of December 2025, the code is expected to be stabilised, with model weights released and a PyPI package published.
 
-For an step-by-step explanation to reproduce the model, refer to the [quickstart in the documentation](https://abc8747.github.io/microfuel).
+For a step-by-step reproduction guide, refer to the [Quickstart section](https://abc8747.github.io/microfuel/quickstart) of our documentation.
 
-A [`tangram` plugin](https://github.com/open-aviation/tangram) will also be created to demonstrate real-time fuel inference from [`jet1090` data](https://github.com/xoolive/rs1090).
+A [`tangram` plugin](https://github.com/open-aviation/tangram) will also be developed to demonstrate real-time fuel inference from live [`jet1090` data](https://github.com/xoolive/rs1090).

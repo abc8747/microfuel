@@ -25,6 +25,10 @@ A visualisation of the fuel burn in a simple altitude/speed plot.
 
 ![image](assets/speed_alt_fuel_burn.png)
 
+A visualisation of the preprocessed trajectory features. Notice that state vectors are irregularly sampled, often with significant time gaps.
+
+![image](assets/phase1_prc772360807.png)
+
 ### Weather Data
 
 !!! note
