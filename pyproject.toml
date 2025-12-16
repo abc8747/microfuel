@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "microfuel"
-version = "0.0.0"
+version = "0.0.1"
 description = "A high-performance, minimal model for aircraft fuel consumption prediction, trained using open ADS-B and ACARS data."
 authors = [{ name = "Abraham Cheung", email = "abraham@ylcheung.com" }]
 readme = "README.md"

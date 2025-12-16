@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 import torch.nn as nn
-from fla.layers import GatedDeltaNet  # see: https://arxiv.org/pdf/2412.06464
+from fla.layers import GatedDeltaNet
+
+if TYPE_CHECKING:
+    from . import Partition
 
 logger = logging.getLogger(__name__)
 
@@ -31,20 +34,11 @@ class ZeroCentredRMSNorm(nn.Module):
 
 
 class Pooler(nn.Module):
-    def __init__(self, mode: Literal["mean", "last"] = "last"):
+    def __init__(self):
         super().__init__()
-        self.mode = mode
 
     def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
-        if self.mode == "last":
-            return x[cu_seqlens[1:] - 1]
-        elif self.mode == "mean":
-            indices = torch.arange(x.size(0), device=x.device)
-            return torch.nn.functional.embedding_bag(
-                indices, x, offsets=cu_seqlens[:-1], mode="mean"
-            )
-        else:
-            raise ValueError(f"unknown {self.mode=}")
+        return x[cu_seqlens[1:] - 1]
 
 
 class LinearAttentionBlock(nn.Module):
@@ -100,7 +94,26 @@ class FuelBurnPredictorConfig:
     num_aircraft_types: int
     aircraft_embedding_dim: int
     num_layers: int
-    pooler_mode: Literal["mean", "last"]  # TODO: get rid of this, only support last
+
+
+# TODO: decouple model_config from training config
+@dataclass
+class TrainConfig:
+    partition: Partition
+    batch_size: int
+    epochs: int
+    lr: float
+    weight_decay: float
+    warmup_steps: int
+    seed: int
+    model_config: FuelBurnPredictorConfig
+
+
+@dataclass
+class TrainingState:
+    optimizer_state_dict: dict[str, Any]
+    scaler_state_dict: dict[str, Any]
+    global_step: int
 
 
 class FuelBurnPredictor(nn.Module):
@@ -142,7 +155,7 @@ class FuelBurnPredictor(nn.Module):
                 for _ in range(cfg.num_layers)
             ]
         )
-        self.pooler_segment = Pooler(mode=cfg.pooler_mode)
+        self.pooler_segment = Pooler()
 
         # flight context processing branch
         self.hypernetwork_flight = StaticHyperNet(
@@ -157,7 +170,7 @@ class FuelBurnPredictor(nn.Module):
                 for _ in range(cfg.num_layers)
             ]
         )
-        self.pooler_flight = Pooler(mode=cfg.pooler_mode)
+        self.pooler_flight = Pooler()
 
         # share embedding layer between hypernetworks
         self.hypernetwork_flight.embedding = self.hypernetwork_segment.embedding

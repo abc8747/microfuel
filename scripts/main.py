@@ -1,8 +1,9 @@
 # NOTE: imports here should be minimal, put heavy imports (torch) inside functions!
 from __future__ import annotations
 
+import json
 import logging
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal, NamedTuple, assert_never, overload
 
@@ -12,13 +13,11 @@ from rich.logging import RichHandler
 from microfuel import PATH_CHECKPOINTS, PATH_DATA_RAW, PATH_PREDICTIONS, Partition, Split
 
 if TYPE_CHECKING:
-    from typing import Any
-
     import polars as pl
     import torch
     from rich.progress import Progress
 
-    from microfuel.model import FuelBurnPredictor, FuelBurnPredictorConfig
+    from microfuel.model import FuelBurnPredictor
 
 
 logger = logging.getLogger(__name__)
@@ -206,29 +205,6 @@ def create_era5(
     make_era5(partition=partition)
 
 
-@dataclass
-class TrainConfig:
-    partition: Partition
-    batch_size: int
-    epochs: int
-    lr: float
-    weight_decay: float
-    warmup_steps: int
-    seed: int
-    model_config: FuelBurnPredictorConfig
-    project_name: str
-    exp_name: str
-
-
-@dataclass
-class Checkpoint:
-    model_state_dict: dict[str, Any]
-    optimizer_state_dict: dict[str, Any]
-    scaler_state_dict: dict[str, Any]
-    global_step: int
-    train_config: TrainConfig
-
-
 @app.command()
 def train(
     partition: Partition = "phase1",
@@ -239,16 +215,15 @@ def train(
     num_heads: int = 2,
     num_layers: int = 3,
     aircraft_embedding_dim: int = 8,
-    pooler_mode: Literal["mean", "last"] = "last",
     beta: Annotated[
         float,
         typer.Option(help="Hyperparameter for CB Loss. 0.0 means no reweighting."),
     ] = 0.99,
     *,
     project_name: str = "prc25-multiac",
-    exp_name: str = "gdn-all_ac-v0.0.9",
+    exp_name: str = "gdn-all_ac-v0.0.9",  # TODO: infer from file path
     resume_from: Annotated[
-        Path | None, typer.Option(help="Path to checkpoint to resume training from.")
+        Path | None, typer.Option(help="Path to checkpoint model file (.pt) to resume from.")
     ] = None,
     loss_type: Literal["rmse_rate", "rmse_kg", "rmse_kg2"] = "rmse_kg",
     evaluate_best: Annotated[
@@ -281,7 +256,12 @@ def train(
 
     import wandb
     from microfuel.dataloader import VarlenDataset, collate_fn
-    from microfuel.model import FuelBurnPredictor, FuelBurnPredictorConfig
+    from microfuel.model import (
+        FuelBurnPredictor,
+        FuelBurnPredictorConfig,
+        TrainConfig,
+        TrainingState,
+    )
 
     # NOTE: loading this takes 16GB of RAM on start, but drops to ~4GB
     train_dataset = VarlenDataset(partition=partition, split="train")
@@ -300,14 +280,14 @@ def train(
         weights = (1.0 - beta) / effective_num
         logger.info(f"using cb loss with {beta=} on {class_counts=}: {weights=}")
 
+    # TODO: avoid duplicating model and train config, read from json instead
     model_cfg = FuelBurnPredictorConfig(
         input_dim=train_dataset.all_features.shape[1],
         hidden_size=hidden_size,
         num_heads=num_heads,
-        num_aircraft_types=len(train_dataset.ac_type_vocab),
+        num_aircraft_types=len(train_dataset.ac_type_vocab),  # TODO: make this len(AIRCRAFT_TYPES)
         aircraft_embedding_dim=aircraft_embedding_dim,
         num_layers=num_layers,
-        pooler_mode=pooler_mode,
     )
     cfg = TrainConfig(
         partition=partition,
@@ -318,21 +298,16 @@ def train(
         warmup_steps=warmup_steps,
         seed=seed,
         model_config=model_cfg,
-        project_name=project_name,
-        exp_name=exp_name,
     )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"using device: {device}")
 
-    checkpoint: Checkpoint | None = None
-    if resume_from and resume_from.exists():
-        logger.info(f"loading checkpoint from {resume_from}")
-        with torch.serialization.safe_globals([Checkpoint, TrainConfig, FuelBurnPredictorConfig]):
-            checkpoint = torch.load(resume_from, map_location=device)
-
-    exp_checkpoint_dir = PATH_CHECKPOINTS / cfg.exp_name
+    exp_checkpoint_dir = PATH_CHECKPOINTS / exp_name
     exp_checkpoint_dir.mkdir(exist_ok=True, parents=True)
+
+    with open(exp_checkpoint_dir / "config.json", "w") as f:
+        json.dump(asdict(cfg), f, indent=2)
 
     model = FuelBurnPredictor(cfg.model_config)
     total_params = sum(p.numel() for p in model.parameters())
@@ -360,6 +335,19 @@ def train(
     ]
     optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=cfg.lr)
     criterion = torch.nn.MSELoss(reduction="none")
+    scaler = torch.amp.GradScaler(device=device, enabled=(device == "cuda"))
+
+    global_step = 0
+    if resume_from and resume_from.exists():
+        logger.info(f"loading weights from {resume_from}")
+        model.load_state_dict(torch.load(resume_from, map_location=device))
+        state_path = resume_from.with_name(f"{resume_from.stem}_state.pt")
+        if state_path.exists():
+            logger.info(f"loading optimizer state from {state_path}")
+            state_dict = torch.load(state_path, map_location=device)
+            optimizer.load_state_dict(state_dict.optimizer_state_dict)
+            scaler.load_state_dict(state_dict.scaler_state_dict)
+            global_step = state_dict.global_step
 
     total_training_steps = len(train_dataloader) * cfg.epochs
 
@@ -376,18 +364,10 @@ def train(
 
     scheduler = get_lr_scheduler(optimizer, cfg.warmup_steps, total_training_steps)
 
-    wandb.init(project=cfg.project_name, name=cfg.exp_name, config=asdict(cfg))
+    wandb.init(project=project_name, name=exp_name, config=asdict(cfg))
     wandb.watch(model, log="all", log_freq=100)
 
     model.to(device)
-    scaler = torch.amp.GradScaler(device=device, enabled=(device == "cuda"))
-
-    if checkpoint:
-        # NOTE: assuming reloading from checkpoint to be used for finetuning
-        # so we do not restore optimiser and scaler states!
-        model.load_state_dict(checkpoint.model_state_dict)
-
-    global_step = 0
     best_val_rmse = float("inf")
 
     with Progress(
@@ -397,7 +377,8 @@ def train(
         TaskProgressColumn(),
         TimeRemainingColumn(),
     ) as progress:
-        for epoch in range(cfg.epochs):
+        start_epoch = global_step // len(train_dataloader)
+        for epoch in range(start_epoch, cfg.epochs):
             model.train()
             train_loss_total = 0.0
             train_samples = 0
@@ -476,20 +457,18 @@ def train(
                     )
                     if eval_result.rmse_kg < best_val_rmse:
                         best_val_rmse = eval_result.rmse_kg
-                        checkpoint_path = (
-                            exp_checkpoint_dir / f"step{global_step:05}_{best_val_rmse:.2f}.pt"
-                        )
-                        checkpoint = Checkpoint(
-                            model_state_dict=model.state_dict(),
+                        ckpt_name = f"step{global_step:05}_{best_val_rmse:.2f}_model.pt"
+                        model_path = exp_checkpoint_dir / ckpt_name
+                        torch.save(model.state_dict(), model_path)
+                        state_name = f"step{global_step:05}_{best_val_rmse:.2f}_state.pt"
+                        state_path = exp_checkpoint_dir / state_name
+                        state = TrainingState(
                             optimizer_state_dict=optimizer.state_dict(),
                             scaler_state_dict=scaler.state_dict(),
                             global_step=global_step,
-                            train_config=cfg,
                         )
-                        torch.save(checkpoint, checkpoint_path)
-                        logger.info(
-                            f"wrote {checkpoint_path}: best {best_val_rmse=:.2f} ({eval_result.rmse_rate=:.4f})"
-                        )
+                        torch.save(state, state_path)
+                        logger.info(f"wrote {model_path}: best {best_val_rmse=:.2f}")
                     model.train()
 
                 batch_size = y_log.size(0)
@@ -527,17 +506,18 @@ def train(
     wandb.finish()
 
     if evaluate_best:
-        logger.info("evaluating best model on validation set")
-        best_val, best_checkpoint_path = float("inf"), None
-        for f in exp_checkpoint_dir.iterdir():
-            if f.suffix != ".pt" or (val := float(f.stem.split("_")[1])) >= best_val:
+        best_val, best_model_path = float("inf"), None
+        for f in exp_checkpoint_dir.glob("*_model.pt"):
+            try:
+                val = float(f.name.split("_")[1])
+                if val < best_val:
+                    best_val = val
+                    best_model_path = f
+            except (ValueError, IndexError):
                 continue
-            best_val = val
-            best_checkpoint_path = f
-        if best_checkpoint_path is None:
-            logger.warning("no best model checkpoint found to evaluate.")
-            return
-        evaluate(best_checkpoint_path, partition, "validation", batch_size)
+
+        if best_model_path:
+            evaluate(best_model_path, partition, "validation", batch_size)
 
 
 @overload
@@ -672,7 +652,7 @@ def _run_inference(
 
 @app.command()
 def evaluate(
-    checkpoint_path: Path,
+    model_path: Annotated[Path, typer.Argument(help="Path to the model weights (.pt).")],
     partition: Partition = "phase1",
     split: Split = "validation",
     batch_size: int = 64,
@@ -701,19 +681,16 @@ def evaluate(
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"using device: {device}")
 
-    with torch.serialization.safe_globals([Checkpoint, TrainConfig, FuelBurnPredictorConfig]):
-        checkpoint: Checkpoint = torch.load(checkpoint_path, map_location=device)
-    model_config = checkpoint.train_config.model_config
+    # TODO: use pydantic
+    with open(model_path.parent / "config.json") as f:
+        cfg_dict = json.load(f)
+    model_config = FuelBurnPredictorConfig(**cfg_dict["model_config"])
+
     model = FuelBurnPredictor(model_config)
-    model.load_state_dict(checkpoint.model_state_dict)
+    model.load_state_dict(torch.load(model_path, map_location=device))
     model.to(device)
 
     dataset_split = None if for_submission else split
-    if for_submission and "rank" not in partition:
-        logger.warning(
-            f"generating submission for partition `{partition}` which is not a ranking partition!"
-        )
-
     if source_partitions is None:
         source_partitions = [partition]
         if partition == "phase2_rank" and "phase1_rank" not in source_partitions:
@@ -750,7 +727,7 @@ def evaluate(
                 f" total={eval_result.rmse_kg:.2f} kg"
             )
 
-    exp_name = checkpoint_path.parent.name
+    exp_name = model_path.parent.name
     PATH_PREDICTIONS.mkdir(exist_ok=True, parents=True)
 
     if for_submission:

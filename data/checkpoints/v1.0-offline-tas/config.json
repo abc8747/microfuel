@@ -1,0 +1,17 @@
+{
+  "partition": "phase1",
+  "batch_size": 64,
+  "epochs": 50,
+  "lr": 0.0004,
+  "weight_decay": 0.1,
+  "warmup_steps": 250,
+  "seed": 13,
+  "model_config": {
+    "input_dim": 5,
+    "hidden_size": 32,
+    "num_heads": 2,
+    "num_aircraft_types": 26,
+    "aircraft_embedding_dim": 8,
+    "num_layers": 3
+  }
+}
