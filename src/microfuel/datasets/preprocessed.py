@@ -388,7 +388,7 @@ def make_trajectories(
     path_base: Path = PATH_PREPROCESSED,
     altitude_max: Annotated[float, isqx.aerospace.PRESSURE_ALTITUDE(isqx.M)] = ft2m(50000),
     speed_max: Annotated[float, isqx.SPEED(isqx.M_PERS)] = knot2mps(800),
-    vertical_speed_max: Annotated[float, isqx.aerospace.VS(isqx.M_PERS)] = fpm2mps(8000),
+    vertical_speed_max: Annotated[float, isqx.aerospace.VERTICAL_RATE(isqx.M_PERS)] = fpm2mps(8000),
     track_rate_max: Annotated[float, isqx.RAD_PERS] = 0.003,
     plot_every_n_flights: int | None = None,
 ):

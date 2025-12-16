@@ -160,7 +160,7 @@ class TrajectoryRecord(TypedDict):
     - q=0: 100-foot increments, using gray code for altitudes > 50,175 ft.
 
     Uncertainty: depends on barometric altitude quality (baq)."""
-    groundspeed: Annotated[float, pl.Float64, isqx.aerospace.GS(isqx.usc.KNOT)] | None
+    groundspeed: Annotated[float, pl.Float64, isqx.aerospace.GROUND_SPEED(isqx.usc.KNOT)] | None
     """Ground speed (GNSS or inertial reference system, tc=19, subtypes1-2).
 
     Not transmitted directly, encoded as two signed velocity components (east-west velocity,
@@ -173,7 +173,8 @@ class TrajectoryRecord(TypedDict):
     Uncertainty: nacv=4 (< 0.3m/s), nacv=3 (< 1.0m/s), nacv=2 (< 3.0m/s), nacv=1 (< 10.0m/s)"""
     track: Annotated[float, pl.Float64, isqx.DEG] | None  # see above.
     vertical_rate: (
-        Annotated[float, pl.Float64, isqx.aerospace.VS(isqx.usc.FT * isqx.MIN**-1)] | None
+        Annotated[float, pl.Float64, isqx.aerospace.VERTICAL_RATE(isqx.usc.FT * isqx.MIN**-1)]
+        | None
     )
     """Vertical rate (`vrsrc` specifies origin: GNSS or barometric, tc=19).
 
@@ -185,12 +186,12 @@ class TrajectoryRecord(TypedDict):
     """Mach number (Mode S, BDS 6,0, 10 bits, mb 25-34).
 
     Quantisation: 0.004."""
-    TAS: Annotated[float, pl.Float64, isqx.aerospace.TAS(isqx.usc.KNOT)] | None
+    TAS: Annotated[float, pl.Float64, isqx.aerospace.TRUE_AIRSPEED(isqx.usc.KNOT)] | None
     """True airspeed.
 
     - ADS-B (tc=19, subtype 3/4) - Quantisation: 1 kt (subtype 3), 4 kt (subtype 4).
     - Mode S (BDS 5,0 track and turn report, 10 bits, mb 47-56) - Quantisation: 2 kt"""
-    CAS: Annotated[float, pl.Float64, isqx.aerospace.CAS(isqx.usc.KNOT)] | None
+    CAS: Annotated[float, pl.Float64, isqx.aerospace.CALIBRATED_AIRSPEED(isqx.usc.KNOT)] | None
     """Calibrated airspeed. Not broadcast, but likely derived from indicated airspeed (BDS 6,0).
 
     Quantisation: 1 kt."""

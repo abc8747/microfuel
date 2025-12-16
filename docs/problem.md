@@ -9,13 +9,13 @@ $$
 where:
 
 - $m$: Aircraft [mass][isqx.MASS] (time-varying: $m(t) = m_0 - \int_0^t \dot{m}_f(\tau) d\tau$). Note that the [initial takeoff mass][isqx.aerospace.TAKEOFF_MASS] is unknown.
-- $\dot{V}$: Rate of change of the [true airspeed][isqx.aerospace.TAS] along the flight path.
+- $\dot{V}$: Rate of change of the [true airspeed][isqx.aerospace.TRUE_AIRSPEED] along the flight path.
 - $T$: [Thrust][isqx.THRUST].
 - $D$: [Drag][isqx.aerospace.DRAG] ($D = \frac{1}{2}\rho V^2 S C_D$).
 - $g$: [Gravitational acceleration][isqx.ACCELERATION_OF_FREE_FALL].
 - $\gamma$: Flight path angle.
 
-The instantaneous fuel flow is related to thrust via the [thrust specific fuel consumption][isqx.aerospace.TSFC] $c_T$: $\dot{m}_f = c_T T$, which varies with the aircraft's altitude and mach number ([Bartel and Young, 2008](https://arc.aiaa.org/doi/10.2514/1.35589))
+The instantaneous fuel flow is related to thrust via the [thrust specific fuel consumption][isqx.aerospace.THRUST_SPECIFIC_FUEL_CONSUMPTION] $c_T$: $\dot{m}_f = c_T T$, which varies with the aircraft's altitude and mach number ([Bartel and Young, 2008](https://arc.aiaa.org/doi/10.2514/1.35589))
 
 ## Identifiability
 
