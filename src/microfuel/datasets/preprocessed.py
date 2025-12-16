@@ -1102,13 +1102,19 @@ def prepare_iterator_data(
     segment_ids: Collection[SegmentId] | None = None,
     stats: Stats | None = None,
     path_base: Path = PATH_PREPROCESSED,
+    source_partitions: list[Partition] | None = None,
 ) -> IteratorData:
     """Prepares data required by the dataloader."""
     fuel_lf = raw.scan_fuel(partition)
     if segment_ids:
         fuel_lf = fuel_lf.filter(pl.col("idx").is_in(segment_ids))
 
-    flight_list_lf = raw.scan_flight_list(partition)
+    if source_partitions is None:
+        source_partitions = [partition]
+
+    flight_lists = [raw.scan_flight_list(p) for p in source_partitions]
+    assert flight_lists
+    flight_list_lf = pl.concat(flight_lists)
     segments_df = (
         fuel_lf.join(
             flight_list_lf.select("flight_id", "takeoff", "landed", "aircraft_type"),
@@ -1118,9 +1124,23 @@ def prepare_iterator_data(
         .collect()
     )
 
+    segments_df = (
+        fuel_lf.join(
+            flight_list_lf.select("flight_id", "takeoff", "landed", "aircraft_type"),
+            on="flight_id",
+        )
+        .sort("flight_id")
+        .collect()
+    )
+
+    traj_paths = [path_base / f"trajectories_{p}.parquet" for p in source_partitions]
+    traj_paths = [p for p in traj_paths if p.exists()]
+    assert traj_paths
+    logger.info(f"loading trajectories from {len(traj_paths)} partitions: {source_partitions}")
+
     # optimisation: select specific columns early to avoid OOM during large joins
-    traj_cols = ["flight_id", "timestamp", *CORE_FEATURES]
-    traj_lf = pl.scan_parquet(path_base / f"trajectories_{partition}.parquet").select(traj_cols)
+    traj_cols = ["flight_id", "timestamp", *STATE_FEATURES]
+    traj_lf = pl.scan_parquet(traj_paths).select(traj_cols)
     derived_path = path_base / f"derived_{partition}.parquet"
     if derived_path.exists() and WEATHER_FEATURES:
         derived_lf = pl.scan_parquet(derived_path)

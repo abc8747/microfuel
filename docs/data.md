@@ -10,6 +10,19 @@ Summary statistics:
 
 ## First party data
 
+!!! warning "Identifier Uniqueness"
+
+    The segment identifier `idx` in the [fuel][microfuel.datasets.raw.FuelRecord] files is **not globally unique**. It resets between competition phases/months.
+
+    For example, `idx=0` exists in both Phase 1 (September) and Phase 2 (October). When performing joins or evaluations spanning multiple partitions, you should use the composite key `(idx, flight_id)` to avoid data misalignment.
+
+!!! warning "Phase 2 Data"
+
+    In Phase 2, fuel data `fuel_phase2_rank.parquet` contains **both September and October** data.
+    But flight list data `flight_list_phase2_rank` and trajectory data `flights_phase2_rank/prc*.parquet` contains **only October** data.
+
+    Take caution when joining data.
+
 Schema:
 
 - [Fuel][microfuel.datasets.raw.FuelRecord]

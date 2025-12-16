@@ -579,6 +579,7 @@ def _run_inference(
     model.eval()
     all_preds_rate, all_trues_rate, all_segment_ids, all_durations = [], [], [], []
     all_aircraft_type_idxs = []  # needed for wandb logging per ac type
+    all_flight_ids = []  # needed for joining, as idx is not unique across phases
 
     with torch.no_grad():
         task = progress.add_task(description, total=len(dataloader))
@@ -602,6 +603,7 @@ def _run_inference(
                 data.aircraft_type_idx.to(device),
                 data.durations.cpu(),
             )
+            flight_ids = data.flight_ids
             with torch.autocast(
                 device_type=device, dtype=torch.bfloat16, enabled=(device == "cuda")
             ):
@@ -618,6 +620,7 @@ def _run_inference(
             all_segment_ids.append(segment_ids)
             all_durations.append(durations)
             all_aircraft_type_idxs.append(aircraft_type_idx.cpu())
+            all_flight_ids.extend(flight_ids)
 
             if is_eval:
                 y_true_rate = torch.expm1(y_log)
@@ -636,6 +639,7 @@ def _run_inference(
         df = pl.DataFrame(
             {
                 "segment_id": segment_ids_tensor.numpy(),
+                "flight_id": all_flight_ids,
                 "duration_s": durations_tensor.numpy(),
                 "y_true_rate": trues_rate_tensor.numpy(),
                 "y_pred_rate": preds_rate_tensor.to(torch.float32).numpy(),
@@ -659,6 +663,7 @@ def _run_inference(
         df = pl.DataFrame(
             {
                 "idx": segment_ids_tensor.numpy(),
+                "flight_id": all_flight_ids,
                 "fuel_kg": preds_kg_tensor.to(torch.float32).numpy(),
             }
         )
@@ -673,6 +678,13 @@ def evaluate(
     batch_size: int = 64,
     *,
     for_submission: bool = False,
+    source_partitions: Annotated[
+        list[str] | None,
+        typer.Option(
+            help="List of partitions to load trajectory data from. Defaults to [partition]. "
+            "Use this to load trajectories from multiple phases."
+        ),
+    ] = None,
 ):
     import polars as pl
     import torch
@@ -702,7 +714,15 @@ def evaluate(
             f"generating submission for partition `{partition}` which is not a ranking partition!"
         )
 
-    dataset = VarlenDataset(partition=partition, split=dataset_split)
+    if source_partitions is None:
+        source_partitions = [partition]
+        if partition == "phase2_rank" and "phase1_rank" not in source_partitions:
+            logger.info("detected phase2_rank, adding phase1_rank to source partitions")
+            source_partitions = ["phase1_rank", "phase2_rank"]
+
+    dataset = VarlenDataset(
+        partition=partition, split=dataset_split, source_partitions=source_partitions
+    )
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
     with Progress() as progress:
@@ -714,7 +734,10 @@ def evaluate(
             df_template = (
                 raw.scan_fuel(partition).select("idx", "flight_id", "start", "end").collect()
             )
-            df = df_template.join(df_preds, on="idx", how="left").with_columns(pl.col("fuel_kg"))
+            # NOTE: idx is not unique across partitions!
+            df = df_template.join(df_preds, on=["idx", "flight_id"], how="left").with_columns(
+                pl.col("fuel_kg")
+            )
             df = df.select("idx", "flight_id", "start", "end", "fuel_kg")
         else:
             eval_result = _run_inference(

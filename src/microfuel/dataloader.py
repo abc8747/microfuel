@@ -50,6 +50,7 @@ VarlenBatch = namedtuple(
         "segment_ids",
         "aircraft_type_idx",
         "durations",
+        "flight_ids",
     ],
 )
 
@@ -99,9 +100,12 @@ def _prepare_tensors(
     segment_ids: list[int] | None,
     stats: preprocessed.Stats,
     ac_type_vocab: dict[str, int],
+    source_partitions: list[Partition] | None = None,
 ) -> tuple[torch.Tensor, list[SequenceInfo]]:
     """Loads data, computes features, and prepares tensors for the Dataset."""
-    it_data = preprocessed.prepare_iterator_data(partition, segment_ids, stats=None)
+    it_data = preprocessed.prepare_iterator_data(
+        partition, segment_ids, stats=None, source_partitions=source_partitions
+    )
     all_trajs_df = (
         it_data.traj_lf.filter(pl.col("flight_id").is_in(flight_ids))
         .sort("flight_id", "timestamp")
@@ -176,7 +180,12 @@ def _prepare_tensors(
 
 
 class VarlenDataset(Dataset):
-    def __init__(self, partition: Partition, split: Split | None):
+    def __init__(
+        self,
+        partition: Partition,
+        split: Split | None,
+        source_partitions: list[Partition] | None = None,
+    ):
         if split:
             splits = preprocessed.load_splits(partition)
             segment_ids = splits[split]
@@ -203,7 +212,7 @@ class VarlenDataset(Dataset):
         self.ac_type_vocab = {ac_type: i for i, ac_type in enumerate(AIRCRAFT_TYPES)}
 
         self.all_features, self.sequences = _prepare_tensors(
-            partition, flight_ids, segment_ids, self.stats, self.ac_type_vocab
+            partition, flight_ids, segment_ids, self.stats, self.ac_type_vocab, source_partitions
         )
 
         counts = Counter(s.aircraft_type_idx for s in self.sequences)
@@ -247,6 +256,7 @@ def collate_fn(batch_sequences: list[Sequence]) -> VarlenBatch:
         [seq.aircraft_type_idx for seq in batch_sequences], dtype=torch.long
     )
     durations = torch.tensor([seq.duration_s for seq in batch_sequences], dtype=torch.float32)
+    flight_ids = [seq.flight_id for seq in batch_sequences]
 
     return VarlenBatch(
         x_flight=x_flight,
@@ -257,4 +267,5 @@ def collate_fn(batch_sequences: list[Sequence]) -> VarlenBatch:
         segment_ids=segment_ids,
         aircraft_type_idx=aircraft_type_idx,
         durations=durations,
+        flight_ids=flight_ids,
     )
